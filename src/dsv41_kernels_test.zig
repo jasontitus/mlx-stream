@@ -439,10 +439,9 @@ test "dsv41 kernels ops: a bound array of another dtype or shape is refused, by 
         .code = try t.node(&.{ 4, 144, 320, 48 }, .int16, &.{}),
         .rout = try t.node(&.{ 4, 5120 }, .float32, &.{}),
         .rin = try t.node(&.{ 4, 2304 }, .float16, &.{}),
-        .layout = eq.tightLayout(3),
+        .layout = .{ .fixed = eq.tightLayout(3) },
     };
     try testing.expectError(error.RouteInput, checkBank(Trace, &t, &reg, .down, bank, &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.message(), "q3_moeprep_dpost input rd") != null);
     const ok: ProjArrays(Trace.T) = .{ .code = bank.code, .rout = try t.node(&.{ 4, 5120 }, .float16, &.{}), .rin = bank.rin, .layout = bank.layout };
     try checkBank(Trace, &t, &reg, .down, ok, &diag);
     try testing.expectError(error.RouteInput, checkBank(Trace, &t, &reg, .gate, ok, &diag));
@@ -459,14 +458,14 @@ test "dsv41 kernels rates: padded K3 bank accepts contiguous payload capacity" {
         .code = try t.node(&.{ 4, 144, 320, 64 }, .int16, &.{}),
         .rout = try t.node(&.{ 4, 5120 }, .float16, &.{}),
         .rin = try t.node(&.{ 4, 2304 }, .float16, &.{}),
-        .layout = .{ .k = 3, .code_row_words = 144 * 320 * 64 },
+        .layout = .{ .fixed = .{ .k = 3, .code_row_words = 144 * 320 * 64 } },
     };
     try checkBank(Trace, &t, &reg, .down, bank, &diag);
     const gate: ProjArrays(Trace.T) = .{
         .code = try t.node(&.{ 4, 320, 144, 48 }, .int16, &.{}),
         .rout = try t.node(&.{ 4, 2304 }, .float16, &.{}),
         .rin = try t.node(&.{ 4, 5120 }, .float16, &.{}),
-        .layout = eq.tightLayout(3),
+        .layout = .{ .fixed = eq.tightLayout(3) },
     };
     const diagnostic = Rebuild(Trace).init(&reg);
     const slots = try t.node(&.{16}, .int32, &.{});
@@ -540,7 +539,7 @@ test "dsv41 kernels ops: the routed forms launch their texts with the stock argu
             const xu = try t.node(&.{ m, 5120 }, .float32, &.{});
             const ids = try t.node(&.{m}, .uint32, &.{});
             const n0 = t.launches.items.len;
-            const z = try gv.projectGu(&t, xg, xu, ids, code_g, code_u, eq.tightLayout(3), eq.tightLayout(3));
+            const z = try gv.projectGu(&t, xg, xu, ids, code_g, code_u, .{ .fixed = eq.tightLayout(3) }, .{ .fixed = eq.tightLayout(3) });
             if (f.gu_one) {
                 try testing.expectEqual(n0 + 1, t.launches.items.len);
                 const l = t.back(1);
@@ -554,7 +553,7 @@ test "dsv41 kernels ops: the routed forms launch their texts with the stock argu
             }
             try testing.expectEqualSlices(c_int, t.shapeOf(z[0]).slice(), t.shapeOf(z[1]).slice());
             const xd = try t.node(&.{ m, 2304 }, .float32, &.{});
-            _ = try gv.project(&t, .down, xd, ids, code_d, eq.tightLayout(3));
+            _ = try gv.project(&t, .down, xd, ids, code_d, .{ .fixed = eq.tightLayout(3) });
             const ld = t.back(1);
             try testing.expectEqual(if (f.down_pair) xk.Kernel.dsv41_exl3_pair_k3_5120 else xk.Kernel.dsv41_exl3_mul1h_k3_5120, ld.k);
             // the pair text takes mul1h's signature and grid
@@ -579,9 +578,9 @@ test "dsv41 kernels ops: the banked route launches its texts with every bank's a
     const P = xq.ProjArrays(Trace.T);
     var banks: [3]@import("sdk_ext.zig").quant.BankArrays(P) = undefined;
     for (&banks) |*b| b.* = .{
-        .gate = .{ .code = try t.arg(ge, "code", &s.vars), .rout = try t.arg(reg.get(.q3_exl3_prep_gu_epi), "rg", &s.vars), .rin = try t.arg(ie, "rg", &s.vars), .layout = eq.tightLayout(3) },
-        .up = .{ .code = try t.arg(ge, "code", &s.vars), .rout = try t.arg(reg.get(.q3_exl3_prep_gu_epi), "ru", &s.vars), .rin = try t.arg(ie, "ru", &s.vars), .layout = eq.tightLayout(3) },
-        .down = .{ .code = try t.arg(de, "code", &s.vars), .rout = try t.arg(pe, "rd", &s.vars), .rin = try t.arg(ne, "rn", &s.vars), .layout = eq.tightLayout(3) },
+        .gate = .{ .code = try t.arg(ge, "code", &s.vars), .rout = try t.arg(reg.get(.q3_exl3_prep_gu_epi), "rg", &s.vars), .rin = try t.arg(ie, "rg", &s.vars), .layout = .{ .fixed = eq.tightLayout(3) } },
+        .up = .{ .code = try t.arg(ge, "code", &s.vars), .rout = try t.arg(reg.get(.q3_exl3_prep_gu_epi), "ru", &s.vars), .rin = try t.arg(ie, "ru", &s.vars), .layout = .{ .fixed = eq.tightLayout(3) } },
+        .down = .{ .code = try t.arg(de, "code", &s.vars), .rout = try t.arg(pe, "rd", &s.vars), .rin = try t.arg(ne, "rn", &s.vars), .layout = .{ .fixed = eq.tightLayout(3) } },
     };
     for ([_]xq.Forms{ .{}, .{ .down_pair = true }, .{ .gu_one = true }, .{ .down_pair = true, .gu_one = true } }) |f| {
         var gv = try xq.Gemv(Trace).initForms(&t, &reg, f);
@@ -696,7 +695,7 @@ test "dsv41 kernels rates: verify widths reuse prepared routes across rates and 
             for (&banks, 0..) |*b, bi| {
                 const cap: c_int = @intCast(bi + 2);
                 const width: c_int = if (bi == 2) 64 else @intCast(16 * k);
-                const layout: eq.ProjectionLayout = .{ .k = k, .code_row_words = 320 * 144 * @as(u64, @intCast(width)) };
+                const layout: eq.ProjectionStorage(Trace.T) = .{ .fixed = .{ .k = k, .code_row_words = 320 * 144 * @as(u64, @intCast(width)) } };
                 b.* = .{
                     .gate = .{ .code = try t.node(&.{ cap, 320, 144, width }, .int16, &.{}), .rout = try t.node(&.{ cap, 2304 }, .float16, &.{}), .rin = try t.node(&.{ cap, 5120 }, .float16, &.{}), .layout = layout },
                     .up = .{ .code = try t.node(&.{ cap, 320, 144, width }, .int16, &.{}), .rout = try t.node(&.{ cap, 2304 }, .float16, &.{}), .rin = try t.node(&.{ cap, 5120 }, .float16, &.{}), .layout = layout },

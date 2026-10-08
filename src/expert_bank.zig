@@ -53,6 +53,9 @@ pub const Layer = struct {
     logical_bytes: u64,
     base_offset: u64,
     segments: [n_components]Segment,
+    compact: bool = false,
+    /// Complete immutable capacity schedule, borrowed from the owning Bank.
+    slot_rates: []const [3]u32 = &.{},
 };
 
 /// What the installed kernels decode; a bank outside it is refused.
@@ -65,8 +68,8 @@ pub const Implemented = struct {
     n_layers: u64,
 };
 
-/// DeepSeek-V4.1 MUL1 banks with independent K2/K3/K4 projection rates.
-pub const dsv41: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{ 2, 3, 4 }, .hidden = 5120, .inter = 2304, .n_experts = 384, .n_layers = 40 };
+/// DeepSeek-V4.1 MUL1 banks; K5 requires the compact record layout.
+pub const dsv41: Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{ 2, 3, 4, 5 }, .hidden = 5120, .inter = 2304, .n_experts = 384, .n_layers = 40 };
 
 /// Why a bank was refused, for the one log line the caller writes.
 pub const Diag = @import("sdk").Diag;
@@ -96,6 +99,7 @@ pub const Refusal = error{
 };
 
 pub const format_v2 = "mtplx-expert-manifest-v2";
+pub const format_v3 = "mtplx-expert-manifest-v3";
 pub const format_v1 = "mtplx-expert-manifest-v1";
 /// The v1 runtime manifest's mode for an EXL3 bank (never a tcq3 / mcg bank).
 pub const runtime_mode = "exl3-mul1";
@@ -171,11 +175,11 @@ pub const RecordRef = struct { layer: u32, expert: u32 };
 pub fn submitRecords(pool: *expert_io.Pool, bank: *const Bank, records: []const RecordRef, rows: []const [n_components]u64) !u32 {
     if (records.len != rows.len or records.len == 0 or records.len > expert_io.max_items) return error.InvalidJob;
     var lens: [n_components]u64 = undefined;
-    for (&lens, bank.layers[records[0].layer].segments) |*l, sg| l.* = sg.length;
+    for (&lens, bank.recordGeometry(records[0].layer, records[0].expert).segments) |*l, sg| l.* = sg.length;
     var gu: [expert_io.max_items]u64 = undefined;
     var down: [expert_io.max_items]u64 = undefined;
     for (records, 0..) |r, i| {
-        for (lens, bank.layers[r.layer].segments) |l, sg| if (l != sg.length) return error.MixedGeometry;
+        for (lens, bank.recordGeometry(r.layer, r.expert).segments) |l, sg| if (l != sg.length) return error.MixedGeometry;
         const sp = bank.spans(r.layer, r.expert);
         gu[i] = sp.gu_offset;
         down[i] = sp.down_offset;
@@ -199,7 +203,7 @@ pub fn mlxDtype(d: Dtype) mlx.mlx_dtype {
 /// One projection's slot arrays: code int16 [rows, in/16, out/16, 16K], rout f16 [rows, out], rin f16 [rows, in].
 pub const ProjArrays = struct { code: mlx.mlx_array, rout: mlx.mlx_array, rin: mlx.mlx_array };
 /// A bank's nine slot arrays by projection.
-pub const BankArrays = struct { gate: ProjArrays, up: ProjArrays, down: ProjArrays };
+pub const BankArrays = struct { gate: ProjArrays, up: ProjArrays, down: ProjArrays, descriptors: ?[3]mlx.mlx_array = null };
 
 pub fn bankArraysOf(x: [n_components]mlx.mlx_array) BankArrays {
     return .{ .gate = .{ .code = x[0], .rout = x[1], .rin = x[2] }, .up = .{ .code = x[3], .rout = x[4], .rin = x[5] }, .down = .{ .code = x[6], .rout = x[7], .rin = x[8] } };
@@ -219,6 +223,27 @@ pub const Bank = struct {
     sidecar: expert_io.UncachedFd = .{ .fd = -1, .size = 0 },
     /// Bytes the records occupy (v2 `sidecar.size`, <= the file's).
     sidecar_size: u64 = 0,
+    classes: []Layer = &.{},
+    records: []Record = &.{},
+    expert_rates: [][3]u32 = &.{},
+    slot_rates: [][3]u32 = &.{},
+
+    pub const Record = struct { class: u32, offset: u64 };
+
+    pub fn isCompact(self: *const Bank) bool {
+        return self.records.len != 0;
+    }
+
+    pub fn recordGeometry(self: *const Bank, layer: u32, expert: u32) *const Layer {
+        if (!self.isCompact()) return &self.layers[layer];
+        return &self.classes[self.records[@as(usize, layer) * self.n_experts + expert].class];
+    }
+
+    pub fn metadataBytes(self: *const Bank) u64 {
+        if (!self.isCompact()) return 0;
+        return self.classes.len * @sizeOf(Layer) + self.records.len * @sizeOf(Record) +
+            (self.expert_rates.len + self.slot_rates.len) * @sizeOf([3]u32);
+    }
 
     /// sha256 of the padded record (v2) and of its logical bytes (v1).
     pub const Digests = struct { padded: [32]u8, logical: [32]u8 };
@@ -230,6 +255,21 @@ pub const Bank = struct {
         if (!std.fs.path.isAbsolute(dir)) return refuse(diag, error.BankDirNotAbsolute, "bank dir \"{s}\" is not an absolute path", .{dir});
         var bank: Bank = .{ .allocator = allocator };
         errdefer bank.deinit();
+        const v3 = ManifestSource.open(allocator, io, dir, "expert-manifest-v3.json", diag) catch |e| switch (e) {
+            error.ManifestMissing => null,
+            else => return e,
+        };
+        if (v3) |src| {
+            defer src.deinit();
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const j = try src.parse(V3Json, arena.allocator());
+            if (try src.next() != .end_of_document) return error.ManifestSyntax;
+            try bank.adoptV3(j, implemented, diag);
+            bank.sidecar_path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir, j.sidecar.?.file }, 0);
+            try bank.openSidecar(diag);
+            return bank;
+        }
         var v2 = try parseV2(allocator, io, dir, diag);
         defer v2.deinit(allocator);
         try bank.adoptV2(&v2, implemented, diag);
@@ -243,23 +283,129 @@ pub const Bank = struct {
         if (self.sidecar.fd >= 0) self.sidecar.close();
         self.allocator.free(self.layers);
         self.allocator.free(self.digests);
+        self.allocator.free(self.classes);
+        self.allocator.free(self.records);
+        self.allocator.free(self.expert_rates);
+        self.allocator.free(self.slot_rates);
         if (self.sidecar_path.len > 0) self.allocator.free(self.sidecar_path);
         self.* = undefined;
     }
 
     pub fn recordOffset(self: *const Bank, layer: u32, expert: u32) u64 {
+        if (self.isCompact()) return self.records[@as(usize, layer) * self.n_experts + expert].offset;
         const l = &self.layers[layer];
         return l.base_offset + @as(u64, expert) * l.record_bytes;
     }
 
     pub fn spans(self: *const Bank, layer: u32, expert: u32) Spans {
         const off = self.recordOffset(layer, expert);
-        const segs = &self.layers[layer].segments;
+        const segs = &self.recordGeometry(layer, expert).segments;
         return .{ .gu_offset = off + segs[0].offset, .down_offset = off + segs[gu_components].offset };
     }
 
     pub fn digest(self: *const Bank, layer: u32, expert: u32) *const Digests {
         return &self.digests[@as(usize, layer) * self.n_experts + expert];
+    }
+
+    fn adoptV3(self: *Bank, j: V3Json, implemented: Implemented, diag: ?*Diag) !void {
+        if (!std.mem.eql(u8, j.format, format_v3)) return error.ManifestFormat;
+        var quant_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer quant_arena.deinit();
+        const q = std.json.parseFromValueLeaky(QuantJson, quant_arena.allocator(), j.quantization, .{ .ignore_unknown_fields = true }) catch return error.ManifestSyntax;
+        if (!std.mem.eql(u8, q.mode, "exl3") or q.tile.size != 16) return error.ManifestFormat;
+        if (!containsStr(implemented.codebooks, q.codebook)) return error.CodebookNotImplemented;
+        if (!std.mem.eql(u8, q.codebook, "mul1") or q.codebook_multiplier != mul1_multiplier) return error.CodebookMultiplier;
+        const d = j.dims;
+        if (d.n_layers == 0 or d.n_layers > max_layers or d.n_experts == 0 or d.n_experts >= max_experts or
+            d.n_layers * d.n_experts > max_records or layerSegments(1, d.hidden, d.inter) == null) return error.DimsInvalid;
+        if (d.hidden != implemented.hidden or d.inter != implemented.inter or d.n_experts != implemented.n_experts or d.n_layers != implemented.n_layers)
+            return error.DimsNotImplemented;
+        if (j.classes.len == 0 or j.classes.len > 512) return error.LayerGeometry;
+        if (j.records.len != d.n_layers * d.n_experts) return error.RecordCount;
+        const sc = j.sidecar orelse return error.ManifestSyntax;
+        if (!plainName(sc.file) or sc.alignment != record_alignment or sc.size > std.math.maxInt(i64)) return error.SidecarGeometry;
+        if (!j.parity.all_pass) return error.ParityNotPassed;
+        const a = self.allocator;
+        self.hidden = d.hidden;
+        self.inter = d.inter;
+        self.n_experts = @intCast(d.n_experts);
+        self.sidecar_size = sc.size;
+        self.classes = try a.alloc(Layer, j.classes.len);
+        for (j.classes, self.classes, 0..) |c, *geometry, i| {
+            if (c.class != i) return error.LayerGeometry;
+            geometry.* = projectionSegments(c.projection_K, d.hidden, d.inter) orelse return error.LayerGeometry;
+            if (c.logical_bytes != geometry.logical_bytes or c.record_bytes != geometry.record_bytes or !segmentsMatch(c.segments, geometry, 0))
+                return refuse(diag, error.LayerGeometry, "v3: class {d} is not a canonical GU6/down3 record", .{i});
+        }
+        self.layers = try a.alloc(Layer, @intCast(d.n_layers));
+        self.records = try a.alloc(Record, j.records.len);
+        self.digests = try a.alloc(Digests, j.records.len);
+        self.expert_rates = try a.alloc([3]u32, j.records.len);
+        self.slot_rates = try a.alloc([3]u32, j.records.len);
+        const seen = try a.alloc(bool, j.records.len);
+        defer a.free(seen);
+        @memset(seen, false);
+        const Interval = struct { lo: u64, hi: u64 };
+        const intervals = try a.alloc(Interval, j.records.len);
+        defer a.free(intervals);
+        for (j.records, intervals) |r, *interval| {
+            const class = r.class orelse return error.RecordGeometry;
+            if (r.layer >= d.n_layers or r.expert >= d.n_experts or class >= self.classes.len) return error.RecordGeometry;
+            const index: usize = @intCast(r.layer * d.n_experts + r.expert);
+            if (seen[index]) return error.RecordDuplicate;
+            seen[index] = true;
+            const geometry = &self.classes[@intCast(class)];
+            for (geometry.projection_k) |k| if (!containsInt(implemented.k, k)) return error.KNotImplemented;
+            const end = std.math.add(u64, r.sidecar_offset, r.record_bytes) catch return error.RecordGeometry;
+            if (end > self.sidecar_size or r.record_bytes != geometry.record_bytes or r.logical_bytes != geometry.logical_bytes or r.sidecar_offset % record_alignment != 0)
+                return error.RecordGeometry;
+            interval.* = .{ .lo = r.sidecar_offset, .hi = end };
+            self.records[index] = .{ .class = @intCast(class), .offset = r.sidecar_offset };
+            self.expert_rates[index] = geometry.projection_k;
+            self.digests[index] = .{
+                .padded = Sha256Hex.parse(r.sha256) orelse return error.RecordSha256,
+                .logical = Sha256Hex.parse(r.logical_sha256) orelse return error.RecordSha256,
+            };
+        }
+        std.sort.pdq(Interval, intervals, {}, struct {
+            fn less(_: void, x: Interval, y: Interval) bool {
+                return x.lo < y.lo;
+            }
+        }.less);
+        for (intervals[1..], intervals[0 .. intervals.len - 1]) |next, prev| if (next.lo < prev.hi) return error.RecordGeometry;
+        const counts = try a.alloc(u32, self.classes.len);
+        defer a.free(counts);
+        const placed = try a.alloc(u32, self.classes.len);
+        defer a.free(placed);
+        for (self.layers, 0..) |*layer, li| {
+            @memset(counts, 0);
+            @memset(placed, 0);
+            var max_k: [3]u32 = @splat(0);
+            const first = li * self.n_experts;
+            for (self.records[first..][0..self.n_experts]) |record| {
+                counts[record.class] += 1;
+                for (&max_k, self.classes[record.class].projection_k) |*m, k| m.* = @max(m.*, k);
+            }
+            const schedule = self.slot_rates[first..][0..self.n_experts];
+            for (schedule, 0..) |*rates, position| {
+                var best: ?usize = null;
+                var deficit: i64 = std.math.minInt(i64);
+                for (counts, placed, 0..) |count, used, ci| {
+                    if (used == count) continue;
+                    const score = @as(i64, count) * @as(i64, @intCast(position + 1)) - @as(i64, used) * self.n_experts;
+                    if (score > deficit) {
+                        best = ci;
+                        deficit = score;
+                    }
+                }
+                const ci = best.?;
+                rates.* = self.classes[ci].projection_k;
+                placed[ci] += 1;
+            }
+            layer.* = projectionSegments(max_k, d.hidden, d.inter).?;
+            layer.compact = true;
+            layer.slot_rates = schedule;
+        }
     }
 
     /// First-boot rules over the parsed v2 manifest (bankv2.check_manifest),
@@ -459,6 +605,96 @@ const Sha256Hex = struct {
 const SegJson = struct { component: []const u8, dtype: []const u8, shape: []const u64, offset: u64, length: u64 };
 const V1SegJson = struct { component: []const u8, dtype: []const u8, shape: []const u64, offset: u64, length: u64, shard: []const u8 };
 const SidecarJson = struct { file: []const u8, alignment: u64, size: u64 };
+
+fn BoundedJsonArray(comptime T: type, comptime maximum: usize) type {
+    return struct {
+        items: []const T = &.{},
+
+        pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.next() != .array_begin) return error.UnexpectedToken;
+            var items: std.ArrayList(T) = .empty;
+            errdefer items.deinit(a);
+            while (try source.peekNextTokenType() != .array_end) {
+                if (items.items.len == maximum) return error.ValueTooLong;
+                try items.append(a, try std.json.innerParse(T, a, source, options));
+            }
+            _ = try source.next();
+            return .{ .items = try items.toOwnedSlice(a) };
+        }
+    };
+}
+
+const ClassSegmentJson = struct {
+    component: []const u8,
+    dtype: []const u8,
+    shape: BoundedJsonArray(u64, 4),
+    offset: u64,
+    length: u64,
+};
+const QuantJson = struct { mode: []const u8, codebook: []const u8, codebook_multiplier: u64, tile: struct { size: u32 } };
+const ClassJson = struct {
+    class: u32,
+    projection_K: [3]u32,
+    record_bytes: u64,
+    logical_bytes: u64,
+    segments: []const SegJson,
+
+    pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ClassJson {
+        const raw = try std.json.innerParse(struct {
+            class: u32,
+            projection_K: [3]u32,
+            record_bytes: u64,
+            logical_bytes: u64,
+            segments: BoundedJsonArray(ClassSegmentJson, n_components),
+        }, a, source, options);
+        const segments = try a.alloc(SegJson, raw.segments.items.len);
+        for (segments, raw.segments.items) |*segment, s| segment.* = .{ .component = s.component, .dtype = s.dtype, .shape = s.shape.items, .offset = s.offset, .length = s.length };
+        return .{ .class = raw.class, .projection_K = raw.projection_K, .record_bytes = raw.record_bytes, .logical_bytes = raw.logical_bytes, .segments = segments };
+    }
+};
+const VariableRecordJson = struct {
+    layer: u64,
+    expert: u64,
+    class: ?u64 = null,
+    sidecar_offset: u64,
+    record_bytes: u64,
+    logical_bytes: u64,
+    sha256: []const u8 = "",
+    logical_sha256: []const u8 = "",
+};
+const V3Json = struct {
+    format: []const u8,
+    quantization: std.json.Value,
+    dims: struct { hidden: u64, inter: u64, n_experts: u64, n_layers: u64 },
+    layers: []const LayerJson = &.{},
+    classes: []const ClassJson = &.{},
+    records: []const VariableRecordJson = &.{},
+    sidecar: ?SidecarJson = null,
+    parity: struct { all_pass: bool } = .{ .all_pass = false },
+
+    pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !V3Json {
+        const raw = try std.json.innerParse(struct {
+            format: []const u8,
+            quantization: std.json.Value,
+            dims: @FieldType(V3Json, "dims"),
+            layers: BoundedJsonArray(LayerJson, max_layers) = .{},
+            classes: BoundedJsonArray(ClassJson, 512) = .{},
+            records: BoundedJsonArray(VariableRecordJson, max_records) = .{},
+            sidecar: ?SidecarJson = null,
+            parity: @FieldType(V3Json, "parity") = .{ .all_pass = false },
+        }, a, source, options);
+        return .{
+            .format = raw.format,
+            .quantization = raw.quantization,
+            .dims = raw.dims,
+            .layers = raw.layers.items,
+            .classes = raw.classes.items,
+            .records = raw.records.items,
+            .sidecar = raw.sidecar,
+            .parity = raw.parity,
+        };
+    }
+};
 
 /// An omitted declaration is distinct from an explicit JSON null, which is invalid.
 fn RateField(comptime T: type) type {
@@ -701,6 +937,7 @@ pub const Peek = struct {
     }
 
     fn adopt(p: *Peek, j: PeekJson, diag: ?*Diag) !void {
+        if (std.mem.eql(u8, j.format, format_v3)) return p.adoptVariable(j, diag);
         const aa = p.arena.allocator();
         if (!std.mem.eql(u8, j.format, format_v2)) return refuse(diag, error.ManifestFormat, "v2 peek: format \"{s}\" is not {s}", .{ j.format, format_v2 });
         if (j.layers.len == 0 or j.layers.len > max_layers or j.layers.len != j.dims.n_layers or j.dims.n_experts == 0 or j.dims.n_experts > max_experts)
@@ -721,14 +958,41 @@ pub const Peek = struct {
         }
         p.view = .{ .quantization = j.quantization, .hidden = j.dims.hidden, .inter = j.dims.inter, .n_experts = j.dims.n_experts, .n_layers = j.dims.n_layers, .layers = layers };
     }
+
+    fn adoptVariable(p: *Peek, j: V3Json, diag: ?*Diag) !void {
+        const a = p.arena.allocator();
+        var bank: Bank = .{ .allocator = a };
+        defer bank.deinit();
+        try bank.adoptV3(j, .{ .codebooks = &.{"mul1"}, .k = &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, .hidden = j.dims.hidden, .inter = j.dims.inter, .n_experts = j.dims.n_experts, .n_layers = j.dims.n_layers }, diag);
+        const layers = try a.alloc(quant.LayerPeek, bank.layers.len);
+        const seen = try a.alloc(bool, bank.classes.len);
+        for (layers, 0..) |*layer, li| {
+            @memset(seen, false);
+            var count: usize = 0;
+            for (bank.records[li * bank.n_experts ..][0..bank.n_experts]) |record| {
+                if (!seen[record.class]) count += 1;
+                seen[record.class] = true;
+            }
+            const layouts = try a.alloc([]const quant.Segment, count);
+            var next: usize = 0;
+            for (bank.classes, seen) |geometry, selected| {
+                if (!selected) continue;
+                const segments = try a.alloc(quant.Segment, n_components);
+                for (geometry.segments, segments, 0..) |segment, *out, ci| out.* = .{
+                    .name = Component.names[ci],
+                    .dtype = @tagName(segment.dtype),
+                    .shape = try a.dupe(u64, segment.shape[0..segment.rank]),
+                };
+                layouts[next] = segments;
+                next += 1;
+            }
+            layer.* = .{ .bits = 0, .segments = &.{}, .record_layouts = layouts };
+        }
+        p.view = .{ .quantization = j.quantization, .hidden = j.dims.hidden, .inter = j.dims.inter, .n_experts = j.dims.n_experts, .n_layers = j.dims.n_layers, .layers = layers };
+    }
 };
 
-const PeekJson = struct {
-    format: []const u8,
-    quantization: std.json.Value,
-    dims: struct { hidden: u64, inter: u64, n_experts: u64, n_layers: u64 },
-    layers: []const LayerJson,
-};
+const PeekJson = V3Json;
 
 /// `Peek` of a v2 manifest's text.
 pub fn peekText(a: std.mem.Allocator, text: []const u8, diag: ?*Diag) !Peek {
@@ -746,6 +1010,19 @@ pub fn peekText(a: std.mem.Allocator, text: []const u8, diag: ?*Diag) !Peek {
 /// the records skipped.
 pub fn peek(a: std.mem.Allocator, io: std.Io, dir: []const u8, diag: ?*Diag) !Peek {
     if (!std.fs.path.isAbsolute(dir)) return refuse(diag, error.BankDirNotAbsolute, "bank dir \"{s}\" is not an absolute path", .{dir});
+    const variable = ManifestSource.open(a, io, dir, "expert-manifest-v3.json", diag) catch |e| switch (e) {
+        error.ManifestMissing => null,
+        else => return e,
+    };
+    if (variable) |source| {
+        defer source.deinit();
+        var result: Peek = .{ .arena = .init(a), .view = undefined };
+        errdefer result.deinit();
+        const parsed = try source.parse(V3Json, result.arena.allocator());
+        if (try source.next() != .end_of_document) return error.ManifestSyntax;
+        try result.adoptVariable(parsed, diag);
+        return result;
+    }
     var src = try ManifestSource.open(a, io, dir, "expert-manifest-v2.json", diag);
     defer src.deinit();
     var p: Peek = .{ .arena = .init(a), .view = undefined };
@@ -785,6 +1062,208 @@ pub fn fillPattern(buf: []u8, seed: u64) void {
         z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
         z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
         b.* = @truncate(z ^ (z >> 31));
+    }
+}
+
+pub const VariableSynth = struct {
+    hidden: u32 = 64,
+    inter: u32 = 32,
+    n_experts: u32 = 3,
+    n_layers: u32 = 1,
+    rates: []const [3]u32 = &.{ .{ 2, 3, 5 }, .{ 5, 2, 2 }, .{ 2, 5, 2 } },
+    assignments: []const u32 = &.{},
+
+    pub fn classOf(self: VariableSynth, record: usize) usize {
+        return if (self.assignments.len == 0) record % self.rates.len else self.assignments[record];
+    }
+};
+
+/// Independent image arithmetic; neither the manifest nor its bytes use the source's layout builder.
+pub fn writeVariableSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    return writeVariableSynthWith(a, tmp, .{});
+}
+
+pub fn writeVariableSynthWith(a: std.mem.Allocator, tmp: *std.testing.TmpDir, opt: VariableSynth) ![]u8 {
+    const count: usize = @as(usize, opt.n_experts) * opt.n_layers;
+    const logical = try a.alloc(u64, opt.rates.len);
+    defer a.free(logical);
+    const padded = try a.alloc(u64, opt.rates.len);
+    defer a.free(padded);
+    for (opt.rates, logical, padded) |rates, *len, *pad| {
+        len.* = @as(u64, opt.hidden) * opt.inter / 8 * (rates[0] + rates[1] + rates[2]) + 6 * @as(u64, opt.hidden + opt.inter);
+        pad.* = (len.* + 4095) / 4096 * 4096;
+    }
+    const offsets = try a.alloc(u64, count);
+    defer a.free(offsets);
+    var total: u64 = 0;
+    for (0..count) |physical| {
+        const record = (physical + 1) % count;
+        offsets[record] = total;
+        total += padded[opt.classOf(record)];
+    }
+    const image = try a.alloc(u8, @intCast(total));
+    errdefer a.free(image);
+    @memset(image, 0);
+    for (offsets, 0..) |offset, record| fillPattern(image[offset..][0..logical[opt.classOf(record)]], record + 41);
+    var j: std.ArrayList(u8) = .empty;
+    defer j.deinit(a);
+    try j.print(
+        a,
+        "{{\"format\":\"mtplx-expert-manifest-v3\",\"quantization\":{{\"mode\":\"exl3\",\"codebook\":\"mul1\",\"codebook_multiplier\":2212286765,\"tile\":{{\"size\":16}}}},\"dims\":{{\"hidden\":{d},\"inter\":{d},\"n_experts\":{d},\"n_layers\":{d}}},\"sidecar\":{{\"file\":\"experts.bin\",\"alignment\":4096,\"size\":{d}}},\"classes\":[",
+        .{ opt.hidden, opt.inter, opt.n_experts, opt.n_layers, total },
+    );
+    for (opt.rates, 0..) |ks, class| {
+        try j.print(a, "{s}{{\"class\":{d},\"projection_K\":[{d},{d},{d}],\"record_bytes\":{d},\"logical_bytes\":{d},\"segments\":[", .{ if (class == 0) "" else ",", class, ks[0], ks[1], ks[2], padded[class], logical[class] });
+        var offset: u64 = 0;
+        for (0..9) |component| {
+            const projection = component / 3;
+            const code = component % 3 == 0;
+            const input: u64 = if (projection == 2) opt.inter else opt.hidden;
+            const output: u64 = if (projection == 2) opt.hidden else opt.inter;
+            const size: u64 = if (code) input * output * ks[projection] / 8 else 2 * (if (component % 3 == 1) output else input);
+            try j.print(a, "{s}{{\"component\":\"{s}\",\"dtype\":\"{s}\",\"shape\":[", .{ if (component == 0) "" else ",", Component.names[component], if (code) "I16" else "F16" });
+            if (code) {
+                try j.print(a, "{d},{d},{d}", .{ input / 16, output / 16, 16 * ks[projection] });
+            } else try j.print(a, "{d}", .{size / 2});
+            try j.print(a, "],\"offset\":{d},\"length\":{d}}}", .{ offset, size });
+            offset += size;
+        }
+        try j.appendSlice(a, "]}");
+    }
+    try j.appendSlice(a, "],\"records\":[");
+    for (0..count) |order| {
+        const record = (order + 1) % count;
+        const class = opt.classOf(record);
+        const off = offsets[record];
+        var padded_hash: [32]u8 = undefined;
+        var logical_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(image[off..][0..padded[class]], &padded_hash, .{});
+        std.crypto.hash.sha2.Sha256.hash(image[off..][0..logical[class]], &logical_hash, .{});
+        try j.print(a, "{s}{{\"layer\":{d},\"expert\":{d},\"class\":{d},\"sidecar_offset\":{d},\"record_bytes\":{d},\"logical_bytes\":{d},\"sha256\":\"{s}\",\"logical_sha256\":\"{s}\"}}", .{ if (order == 0) "" else ",", record / opt.n_experts, record % opt.n_experts, class, off, padded[class], logical[class], std.fmt.bytesToHex(padded_hash, .lower), std.fmt.bytesToHex(logical_hash, .lower) });
+    }
+    try j.appendSlice(a, "],\"parity\":{\"all_pass\":true}}");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "expert-manifest-v3.json", .data = j.items });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "experts.bin", .data = image });
+    return image;
+}
+
+test "dsv41 bank: variable selected records open from an independent byte image" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image = try writeVariableSynth(testing.allocator, &tmp);
+    defer testing.allocator.free(image);
+    var path_buf: [1024]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    var bank = try Bank.open(testing.allocator, testing.io, path, .{ .codebooks = &.{"mul1"}, .k = &.{ 2, 3, 5 }, .hidden = 64, .inter = 32, .n_experts = 3, .n_layers = 1 }, null);
+    defer bank.deinit();
+    for ([_]u64{ 8192, 0, 4096 }, [_]u64{ 3136, 2880, 2880 }, 0..) |off, len, e| {
+        try testing.expectEqual(off, bank.recordOffset(0, @intCast(e)));
+        var digest_bytes: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(image[off .. off + len], &digest_bytes, .{});
+        try testing.expectEqualSlices(u8, &digest_bytes, &bank.digest(0, @intCast(e)).logical);
+    }
+}
+
+test "dsv41 bank: variable selected map refuses missing duplicate overlapping and malformed records" {
+    const Case = enum { missing, duplicate, overlap, outside, overflow, wrong_class, wrong_length, bad_hash, bad_companion, bad_rate };
+    for (std.enums.values(Case)) |case| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const image = try writeVariableSynth(testing.allocator, &tmp);
+        defer testing.allocator.free(image);
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const text = try tmp.dir.readFileAlloc(testing.io, "expert-manifest-v3.json", a, .limited(1 << 20));
+        var json = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{ .allocate = .alloc_always });
+        const records = json.object.getPtr("records").?;
+        const rec = &records.array.items[0].object;
+        const classes = json.object.getPtr("classes").?;
+        const class = &classes.array.items[0].object;
+        const expected: anyerror = switch (case) {
+            .missing => blk: {
+                records.array.items = records.array.items[0..2];
+                break :blk error.RecordCount;
+            },
+            .duplicate => blk: {
+                rec.getPtr("expert").?.* = .{ .integer = 2 };
+                break :blk error.RecordDuplicate;
+            },
+            .overlap => blk: {
+                rec.getPtr("sidecar_offset").?.* = .{ .integer = 4096 };
+                break :blk error.RecordGeometry;
+            },
+            .outside => blk: {
+                rec.getPtr("sidecar_offset").?.* = .{ .integer = 12288 };
+                break :blk error.RecordGeometry;
+            },
+            .overflow => blk: {
+                rec.getPtr("sidecar_offset").?.* = .{ .number_string = "18446744073709551615" };
+                break :blk error.RecordGeometry;
+            },
+            .wrong_class => blk: {
+                rec.getPtr("class").?.* = .{ .integer = 3 };
+                break :blk error.RecordGeometry;
+            },
+            .wrong_length => blk: {
+                rec.getPtr("logical_bytes").?.* = .{ .integer = 3135 };
+                break :blk error.RecordGeometry;
+            },
+            .bad_hash => blk: {
+                rec.getPtr("logical_sha256").?.* = .{ .string = "abc" };
+                break :blk error.RecordSha256;
+            },
+            .bad_companion => blk: {
+                class.getPtr("segments").?.array.items[1].object.getPtr("dtype").?.* = .{ .string = "I16" };
+                break :blk error.LayerGeometry;
+            },
+            .bad_rate => blk: {
+                class.getPtr("projection_K").?.array.items[0] = .{ .integer = 0 };
+                break :blk error.LayerGeometry;
+            },
+        };
+        const rewritten = try std.json.Stringify.valueAlloc(a, json, .{});
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "expert-manifest-v3.json", .data = rewritten });
+        var path_buf: [1024]u8 = undefined;
+        const path = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+        try testing.expectError(expected, Bank.open(testing.allocator, testing.io, path, .{ .codebooks = &.{"mul1"}, .k = &.{ 2, 3, 5 }, .hidden = 64, .inter = 32, .n_experts = 3, .n_layers = 1 }, null));
+    }
+}
+
+test "dsv41 bank: variable record reads scatter only each selected logical component" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image = try writeVariableSynth(testing.allocator, &tmp);
+    defer testing.allocator.free(image);
+    var path_buf: [1024]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    var bank = try Bank.open(testing.allocator, testing.io, path, .{ .codebooks = &.{"mul1"}, .k = &.{ 2, 3, 5 }, .hidden = 64, .inter = 32, .n_experts = 3, .n_layers = 1 }, null);
+    defer bank.deinit();
+    const pool = try expert_io.Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = 16384, .tickets = 64 });
+    defer pool.stop();
+    const lengths = [_][9]u64{
+        .{ 512, 64, 128, 768, 64, 128, 1280, 128, 64 },
+        .{ 1280, 64, 128, 512, 64, 128, 512, 128, 64 },
+        .{ 512, 64, 128, 1280, 64, 128, 512, 128, 64 },
+    };
+    var buffers: [3][9][1536]u8 = undefined;
+    @memset(std.mem.asBytes(&buffers), 0xa7);
+    var tickets: [3]u32 = undefined;
+    for (&buffers, &tickets, 0..) |*components, *ticket, e| {
+        var destinations: [1][9]u64 = undefined;
+        for (components, &destinations[0]) |*component, *dest| dest.* = @intFromPtr(component);
+        ticket.* = try submitRecords(pool, &bank, &.{.{ .layer = 0, .expert = @intCast(e) }}, &destinations);
+    }
+    for (&buffers, tickets, lengths, [_]u64{ 8192, 0, 4096 }) |*components, ticket, lens, base| {
+        try pool.wait(ticket, 2, std.time.ns_per_s);
+        try testing.expectEqual(expert_io.Status.ok, pool.result(ticket).status);
+        try testing.expectEqual(expert_io.Status.ok, pool.result(ticket + 1).status);
+        var offset = base;
+        for (components, lens) |*component, len| {
+            try testing.expectEqualSlices(u8, image[offset .. offset + len], component[0..len]);
+            try testing.expect(std.mem.allEqual(u8, component[len..], 0xa7));
+            offset += len;
+        }
     }
 }
 
@@ -1298,5 +1777,23 @@ test "dsv41 projection rates: mixed banks retain runtime manifest agreement and 
         var impl = implemented_synth;
         impl.k = &.{ 2, 3, 4 };
         try expectOwnedRefusal(if (bad_sha) error.RecordSha256 else error.RuntimeRecordMismatch, Bank.open(testing.allocator, testing.io, try tmpRoot(&tmp, &root), impl, null));
+    }
+}
+
+test "dsv41 bank: fixed K5 is refused even when the installed compact decoder admits K5" {
+    for ([_][3]u32{ .{ 5, 5, 5 }, .{ 3, 3, 5 }, .{ 5, 3, 3 } }) |rates| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const image = try writeSynth(testing.allocator, &tmp, .{ .projection_k = &.{ rates, rates } });
+        defer testing.allocator.free(image);
+        var root: [512]u8 = undefined;
+        const dir = try tmpRoot(&tmp, &root);
+        var implemented = implemented_synth;
+        implemented.k = &.{ 2, 3, 4, 5 };
+        try expectOwnedRefusal(error.KNotImplemented, Bank.open(testing.allocator, testing.io, dir, implemented, null));
+        try expectOwnedRefusal(error.KNotImplemented, peek(testing.allocator, testing.io, dir, null));
+        const text = try tmp.dir.readFileAlloc(testing.io, "expert-manifest-v2.json", testing.allocator, .limited(1 << 20));
+        defer testing.allocator.free(text);
+        try expectOwnedRefusal(error.KNotImplemented, peekText(testing.allocator, text, null));
     }
 }

@@ -309,6 +309,7 @@ test "dsv41 integer rates: mixed bill owns exact persistent transient and prefix
         config.expert_prefill_rows = 16;
         config.expert_rows = 20;
         const b = try billAfterScratch(&config, mixed);
+        defer b.deinit(testing.allocator);
         try testing.expectEqual(@as(u64, 16 * 14400) + b.transient_rows * 3648, b.slot_prefill);
         try testing.expectEqual(@as(u64, 20 * 14400) + b.transient_decode_rows * 3648, b.slot_decode);
         const mb = try bill.memoryBill(testing.allocator, b);
@@ -337,6 +338,7 @@ test "dsv41 integer rates: mixed bill owns exact persistent transient and prefix
         for (1..5) |extra| {
             mixed.decode_extra_records = @intCast(extra);
             const bx = try billAfterScratch(&config, mixed);
+            defer bx.deinit(testing.allocator);
             try testing.expectEqual(b.slot_decode + case.prefix[extra], bx.slot_decode);
             try testing.expectEqual(fb.totalSlots(true, 20 * 14400 + case.prefix[extra]), bx.decodeTotal());
             try testing.expectEqual(@as(u32, @intCast(extra)), bill.fillExtraRecords(b, bx.decodeTotal()));
@@ -350,5 +352,52 @@ test "dsv41 integer rates: mixed bill owns exact persistent transient and prefix
 fn billAfterScratch(config: *const settings.Config, routes: module.RouteOverrides) !bill.Bill {
     var scratch = std.heap.ArenaAllocator.init(testing.allocator);
     defer scratch.deinit();
-    return bill.billAt(scratch.allocator(), io, config, prompt, max_tokens, null, ceiling, routes);
+    const b = try bill.billAt(scratch.allocator(), io, config, prompt, max_tokens, null, ceiling, routes);
+    return b.retained(testing.allocator);
+}
+
+test "dsv41 memory mini: real compact bill producer owns its SDK table after native arena destruction" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena_live = true;
+    defer if (arena_live) arena.deinit();
+    const a = arena.allocator();
+    const tm = try miniBank(a);
+    defer tm.destroy();
+    _ = try expert_bank.writeVariableSynthWith(a, &tm.tmp, .{
+        .hidden = 64,
+        .inter = 32,
+        .n_experts = n_experts,
+        .n_layers = 5,
+        .rates = &.{ .{ 2, 4, 2 }, .{ 4, 2, 4 } },
+    });
+    var mixed = ov;
+    mixed.bank_geometry.?.k = &.{ 2, 4 };
+    var config = configOf(tm);
+    config.expert_prefill_rows = 16;
+    config.expert_rows = 27;
+    var native = try bill.billAt(a, io, &config, prompt, max_tokens, null, ceiling, mixed);
+    const prompt_total = native.prefillTotal();
+    const decode_total = native.decodeTotal();
+    const construction = native.constructionTerms().sum();
+    const baseline = native.baseline;
+    const retained = try native.retained(testing.allocator);
+    defer retained.deinit(testing.allocator);
+    const mb = try bill.memoryBill(testing.allocator, native);
+    defer mb.free(testing.allocator);
+    @memset(std.mem.sliceAsBytes(@constCast(native.compact_costs.?.code_prefix)), 0xa5);
+    native = undefined;
+    arena.deinit();
+    arena_live = false;
+    try testing.expectEqual(prompt_total, retained.prefillTotal());
+    try testing.expectEqual(decode_total, retained.decodeTotal());
+    const retained_sdk = try bill.memoryBill(testing.allocator, retained);
+    defer retained_sdk.free(testing.allocator);
+    try testing.expectEqual(decode_total, retained_sdk.total(.decode, baseline, 27));
+    try testing.expectEqual(prompt_total, mb.total(.prompt, baseline, 16));
+    try testing.expectEqual(decode_total, mb.total(.decode, baseline, 27));
+    try testing.expectEqual(construction, mb.constructionBytes(16));
+    try sdk.admit(mb, baseline, .{ .prompt = 16, .decode = 27 }, @max(prompt_total, decode_total));
+    try testing.expectError(error.DecodeBaseRowsMismatch, sdk.admit(mb, baseline, .{ .prompt = 17, .decode = 27 }, std.math.maxInt(u64)));
+    const filled = try sdk.fill(mb, baseline, std.math.maxInt(u64), n_experts, 16);
+    try testing.expectEqual(sdk.Rows{ .prompt = 16, .decode = n_experts }, filled);
 }

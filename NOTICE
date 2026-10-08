@@ -68,3 +68,15 @@ are included.
 DeepSeek-V4.1-Flash
 The DeepSeek-V4.1-Flash release's `inference/model.py` is the reference for the
 `deepseek_v41` architecture. No model weights are included in this repository.
+
+================================================================================
+External numerical reference (not vendored)
+================================================================================
+
+PonyExl3
+https://github.com/beamivalice/PonyExl3
+Licensed under Apache-2.0.
+
+scripts/capture_exl3_cpu_reference.py calls the unmodified NumPy reconstruction
+library at revision 8e7fa6b1556f59fc669e25087903b279b9b0346f to capture test
+references. Its code and model weights are not included in this repository.

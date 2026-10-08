@@ -71,9 +71,12 @@ pub const ConfigPeek = struct {
 /// One per-expert tensor of a weight group, as the group's description names it.
 pub const Segment = struct { name: []const u8, dtype: []const u8, shape: []const u64 };
 
-/// One layer's uniform bits per weight (EXL3 K or quantization_config bits) and logical per-expert tensors.
-/// `bits == 0` means there is no single layer-wide rate; the quant must validate each tensor's source geometry.
-pub const LayerPeek = struct { bits: u32, segments: []const Segment };
+/// Exactly one representation: a fixed layer's segments, or its selected unique record layouts.
+pub const LayerPeek = struct {
+    bits: u32,
+    segments: []const Segment,
+    record_layouts: []const []const Segment = &.{},
+};
 
 /// A routed-expert weight group's description at load: what the `quant` kind claims from, once per weight group.
 /// `quantization` is opaque to the host: each quant reads its own fields (EXL3: the bank manifest's `quantization`

@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "1ecc3d1c3b0d475b6ee54e59a22100d2df8b5788e2363310f771e08632f84724";
+pub const manifest_sha256 = "1790f2036ac40b0d962edffe046b9011e364b95385a9269d632803a60bab8594";
 
 /// G7: the package's decode-timers build observes each launch of a bound set (its first dispatches per phase, the
 /// observer `Bound.observe` installs); every other build has no observer field, launch key or call.
@@ -27,10 +27,11 @@ pub const Observer = if (launch_observed) ?*const fn ([]const u8, u64, []const m
 pub const format = "mlx-serve-exl3-kernels-v1";
 const dir = "kernels/exl3/";
 
-/// The bank these texts decode: EXL3 MUL1 with independent K2/K3/K4 projections.
+/// MUL1 banks: fixed K2/K3/K4 projections, compact K2/K3/K4/K5 records.
 pub const bank_codebook = "mul1";
 pub const bank_multiplier: u64 = 0x83DCD12D;
-pub const bank_ks = [_]u32{ 2, 3, 4 };
+pub const fixed_bank_ks = [_]u32{ 2, 3, 4 };
+pub const bank_ks = [_]u32{ 2, 3, 4, 5 };
 
 /// Every kernel of record; the tag is the kernel's MLX name and its file name. A variant
 /// `<base>__<variant>` (appended) is a registered text at other template values / input
@@ -184,6 +185,16 @@ pub const Kernel = enum {
     dsv41_prefill_dig_gemm_2304x5120_xmul1h_rate_m128,
     dsv41_prefill_dig_gemm_2304x5120_xmul1h_rate_m128__k3,
     dsv41_prefill_dig_gemm_2304x5120_xmul1h_rate_m128__k4,
+    dsv41_exl3_mul1h_compact_2304,
+    dsv41_exl3_mul1h_compact_5120,
+    dsv41_exl3_b3_mul1h_compact_2304,
+    dsv41_exl3_b3_mul1h_compact_5120,
+    dsv41_exl3_b3_prep_in_rin_compact,
+    dsv41_exl3_b3_prep_gu_epi_compact,
+    dsv41_exl3_b3_prep_din_rin_compact,
+    dsv41_exl3_b3_moeprep_dpost_compact,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compact_m128,
+    dsv41_prefill_dig_gemm_2304x5120_xmul1h_compact_m128,
 };
 
 /// The text a tag runs: its own, or a variant's base (the part before "__").
@@ -246,6 +257,19 @@ pub const rate_kernels = [_]Kernel{
     .dsv41_prefill_dig_gemm_2304x5120_xmul1h_rate_m128,
     .dsv41_prefill_dig_gemm_2304x5120_xmul1h_rate_m128__k3,
     .dsv41_prefill_dig_gemm_2304x5120_xmul1h_rate_m128__k4,
+};
+
+pub const compact_kernels = [_]Kernel{
+    .dsv41_exl3_mul1h_compact_2304,
+    .dsv41_exl3_mul1h_compact_5120,
+    .dsv41_exl3_b3_mul1h_compact_2304,
+    .dsv41_exl3_b3_mul1h_compact_5120,
+    .dsv41_exl3_b3_prep_in_rin_compact,
+    .dsv41_exl3_b3_prep_gu_epi_compact,
+    .dsv41_exl3_b3_prep_din_rin_compact,
+    .dsv41_exl3_b3_moeprep_dpost_compact,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compact_m128,
+    .dsv41_prefill_dig_gemm_2304x5120_xmul1h_compact_m128,
 };
 
 /// Header texts shared by several kernels (file header_<tag>.metal).
@@ -1156,15 +1180,18 @@ pub const tile_perm: [256]u8 = blk: {
 /// bits ending at bit (p + 1) K, circularly, of the little-endian u32 view of the tile.
 fn tileStates(words: []const i16, K: usize, out: *[256]u16) void {
     const nw = 8 * K;
-    std.debug.assert(K >= 1 and K <= 4);
-    var u: [32]u64 = undefined;
-    for (0..nw) |m| u[m] = @as(u64, @as(u16, @bitCast(words[2 * m]))) | (@as(u64, @as(u16, @bitCast(words[2 * m + 1]))) << 16);
+    std.debug.assert(K >= 1 and K <= 5);
+    std.debug.assert(words.len == 16 * K);
     for (out, 0..) |*o, p| {
         const b1 = (p + 1) * K + 256 * K;
         const hi_word = (b1 - 16) / 32;
         const lo_word = (b1 - 1) / 32;
         const s0: u6 = @intCast((lo_word + 1) * 32 - b1);
-        o.* = @truncate(((u[hi_word % nw] << 32) | u[lo_word % nw]) >> s0);
+        const hi = 2 * (hi_word % nw);
+        const lo = 2 * (lo_word % nw);
+        const upper = @as(u64, @as(u16, @bitCast(words[hi]))) | (@as(u64, @as(u16, @bitCast(words[hi + 1]))) << 16);
+        const lower = @as(u64, @as(u16, @bitCast(words[lo]))) | (@as(u64, @as(u16, @bitCast(words[lo + 1]))) << 16);
+        o.* = @truncate(((upper << 32) | lower) >> s0);
     }
 }
 
@@ -1184,6 +1211,32 @@ pub fn reconstruct(code: []const i16, n_i: usize, n_j: usize, K: usize, table: *
                 if (states) |o| o[at] = s;
             }
         }
+    }
+}
+
+test "exl3 mixed K5 scalar: circular trellis crosses every word boundary" {
+    var code: [80]i16 = undefined;
+    for (&code, 0..) |*word, i| word.* = @bitCast(@as(u16, @truncate(i * 7919 + 0x93ad)));
+    var table: [65536]u16 = undefined;
+    for (&table, 0..) |*value, i| value.* = @intCast(i);
+    var got: [256]u16 = undefined;
+    var states: [256]u16 = undefined;
+    reconstruct(&code, 1, 1, 5, &table, &got, &states);
+    for (0..256) |p| {
+        var want: u16 = 0;
+        for (0..16) |j| {
+            const bit = ((p + 1) * 5 + 1280 - 16 + j) % 1280;
+            const word = bit / 32;
+            const raw = @as(u32, @as(u16, @bitCast(code[2 * word]))) |
+                (@as(u32, @as(u16, @bitCast(code[2 * word + 1]))) << 16);
+            want = (want << 1) | @as(u16, @truncate((raw >> @as(u5, @intCast(31 - bit % 32))) & 1));
+        }
+        const lane = p / 8;
+        const j = p % 8;
+        const row = (lane % 4) * 2 + j % 2 + (if (j % 4 >= 2) @as(usize, 8) else 0);
+        const col = lane / 4 + (if (j >= 4) @as(usize, 8) else 0);
+        try std.testing.expectEqual(want, states[row * 16 + col]);
+        try std.testing.expectEqual(want, got[row * 16 + col]);
     }
 }
 

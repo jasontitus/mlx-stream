@@ -147,7 +147,8 @@ pub fn planRows(a: std.mem.Allocator, io: std.Io, opt: Options, diag: *Diag) !Pl
     var bdiag: expert_bank.Diag = .{};
     var bank = expert_bank.Bank.open(a, io, opt.model_dir, im, &bdiag) catch |e| return refuse(diag, e, "bank: {s}", .{bdiag.message()});
     errdefer bank.deinit();
-    const geometry = try expert_stream.StorageGeometry.init(bank.layers);
+    if (bank.isCompact() and opt.envelope_record) return refuse(diag, error.CompactNeedsNativeAdmission, "admission: compact banks require native row accounting", .{});
+    const geometry = try expert_stream.StorageGeometry.initBank(&bank);
     const record = geometry.max_source_record_bytes;
     const inputs: expert_admission.Inputs = .{
         .baseline_bytes = baseline,

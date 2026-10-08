@@ -131,6 +131,111 @@ test "dsv41 io: pool scatters a synthetic file" {
     }
 }
 
+test "dsv41 io: heterogeneous same-cur speculation and same-tag prereads retain every selected byte" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(10 * page);
+    defer f.deinit();
+    const geometries = [_][9]u64{
+        .{ 512, 64, 128, 768, 64, 128, 1280, 128, 64 },
+        .{ 1280, 64, 128, 512, 64, 128, 512, 128, 64 },
+        .{ 512, 64, 128, 1280, 64, 128, 512, 128, 64 },
+    };
+    const bases = [_]u64{ 2 * page + 123, 4 * page + 77, 6 * page + 91 };
+    const logical = [_]u64{ 3136, 2880, 2880 };
+    const gu_lengths = [_]u64{ 1664, 2176, 2176 };
+    for ([_]bool{ false, true }) |preread| {
+        const pool = try specPool(2, 6);
+        defer pool.stop();
+        defer clearFaults();
+        injectFault(2 * page, 5, 20 * std.time.ns_per_ms);
+        var dests: [3]Dests = undefined;
+        var initialized: usize = 0;
+        defer for (dests[0..initialized]) |d| testing.allocator.free(d.buf);
+        for (geometries, &dests) |lens, *d| {
+            d.* = try Dests.init(1, &lens);
+            initialized += 1;
+        }
+        if (preread) try R96.armPreRead(pool, &geometries[0]);
+        for (geometries, bases, logical) |lens, base, len| {
+            if (preread) {
+                try testing.expectEqual(@as(u32, 2), try R96.preRead(pool, f.ufd, 37, &.{@intCast(base)}, &lens));
+            } else {
+                try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 36, &.{@intCast(base)}, len));
+            }
+        }
+        if (preread) {
+            try waitFor(pool, preStarted2);
+        } else {
+            for (bases) |base| try waitFor(@as(i64, @intCast(base)), landedAt);
+        }
+        var tickets: [3]u32 = undefined;
+        // Every demand binds before the one settle; equal totals need different scatter geometry.
+        for ([_]usize{ 2, 0, 1 }) |i| {
+            tickets[i] = try R96.submit(pool, f.ufd, &.{bases[i]}, &.{bases[i] + gu_lengths[i]}, dests[i].rows[0..1], &geometries[i]);
+        }
+        _ = try pool.specStep(f.ufd, 37, &.{}, 0);
+        for (tickets, dests, geometries, bases, gu_lengths) |ticket, d, lens, base, gu| {
+            try pool.wait(ticket, 2, 10 * std.time.ns_per_s);
+            try testing.expectEqual(Status.ok, pool.result(ticket).status);
+            try testing.expectEqual(Status.ok, pool.result(ticket + 1).status);
+            try d.expectRecord(0, f.image, base, base + gu, &lens);
+        }
+        if (preread) {
+            try testing.expectEqual(@as(i64, 6), pool.counter(.pre_issued));
+            try testing.expectEqual(@as(i64, 0), pool.counter(.pre_expired));
+            try testing.expectEqual(@as(i64, 6), pool.counter(.pre_bound) + pool.counter(.pre_cancelled));
+            try testing.expect(pool.counter(.pre_served) >= 2);
+        } else {
+            try testing.expectEqual(@as(i64, 3), pool.counter(.claimed));
+            try testing.expectEqual(@as(i64, 6), pool.counter(.adopt_ranges));
+            try testing.expectEqual(@as(i64, 8896), pool.counter(.adopt_bytes));
+        }
+    }
+}
+
+test "dsv41 io: speculative and preread bytes never cross source identities at equal offsets" {
+    const page = std.heap.pageSize();
+    var first = try PatternFile.init(4 * page);
+    defer first.deinit();
+    var second = try PatternFile.init(4 * page);
+    defer second.deinit();
+    expert_bank.fillPattern(second.image, 29);
+    try second.tmp.dir.writeFile(testing.io, .{ .sub_path = "pattern.bin", .data = second.image });
+    const lens = [9]u64{ 512, 64, 128, 768, 64, 128, 1280, 128, 64 };
+    const base = page + 123;
+    for ([_]bool{ false, true }) |preread| {
+        const destinations = try Dests.init(1, &lens);
+        defer testing.allocator.free(destinations.buf);
+        // Two workers hold the other source's unbound prereads; demand needs its own worker.
+        const pool = try specPool(3, 4);
+        defer pool.stop();
+        if (preread) {
+            try R96.armPreRead(pool, &lens);
+            _ = try R96.preRead(pool, first.ufd, 37, &.{@intCast(base)}, &lens);
+            waitFor(pool, preStarted2) catch |err| {
+                std.debug.print("source isolation: preread start: {t}\n", .{err});
+                return err;
+            };
+        } else {
+            _ = try pool.specStep(first.ufd, 36, &.{@intCast(base)}, 3136);
+            waitFor(@as(i64, @intCast(base)), landedAt) catch |err| {
+                std.debug.print("source isolation: speculative landing: {t}\n", .{err});
+                return err;
+            };
+        }
+        const ticket = try R96.submit(pool, second.ufd, &.{base}, &.{base + 1664}, destinations.rows[0..1], &lens);
+        pool.wait(ticket, 2, 10 * std.time.ns_per_s) catch |err| {
+            std.debug.print("source isolation: demand preread={} tickets={d}: {t}\n", .{ preread, ticket, err });
+            return err;
+        };
+        try testing.expectEqual(Status.ok, pool.result(ticket).status);
+        try testing.expectEqual(Status.ok, pool.result(ticket + 1).status);
+        try destinations.expectRecord(0, second.image, base, base + 1664, &lens);
+        try testing.expect(!std.mem.eql(u8, first.image[base..][0..3136], destinations.buf));
+        _ = try pool.specStep(second.ufd, 37, &.{}, 0);
+    }
+}
+
 test "dsv41 io: injected faults map to status words" {
     const page = std.heap.pageSize();
     var f = try PatternFile.init(40 * page);

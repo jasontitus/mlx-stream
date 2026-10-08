@@ -359,6 +359,15 @@ pub const Pool = struct {
         }
     }
 
+    /// Registered gates still held by C's satisfied-prefix queue, armed or not.
+    pub fn liveGates(self: *const Pool) !u32 {
+        _ = self;
+        var state: [10]i64 = undefined;
+        const count = c.q3ld_ev_state(&state);
+        if (count < 0) return error.GateRefused;
+        return @intCast(count);
+    }
+
     /// Forces every live gate <= `value` (error paths: nothing may wait for it).
     pub fn releaseGates(self: *Pool, value: u64) void {
         _ = self;

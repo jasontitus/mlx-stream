@@ -461,6 +461,7 @@ fn putInt(buf: []u8, i: usize, dt: mlx.mlx_dtype, v: i64) void {
         .bool_ => buf[i] = @intFromBool(v != 0),
         .int32 => std.mem.writeInt(i32, buf[i * 4 ..][0..4], @intCast(v), .little),
         .uint32 => std.mem.writeInt(u32, buf[i * 4 ..][0..4], @intCast(v), .little),
+        .uint64 => std.mem.writeInt(u64, buf[i * 8 ..][0..8], @intCast(v), .little),
         .int16 => std.mem.writeInt(i16, buf[i * 2 ..][0..2], @intCast(v), .little),
         .uint8 => buf[i] = @intCast(v),
         else => unreachable,
@@ -503,6 +504,24 @@ const Wave = struct {
         return t;
     }
 
+    fn subset(w: *const Wave, first: u64, count: u64) Wave {
+        std.debug.assert(count > 0 and first <= w.total() and count <= w.total() - first);
+        var result: Wave = .{};
+        var begin: u64 = 0;
+        for (w.rows[0..w.n], w.slots[0..w.n]) |rows, slot| {
+            const end = begin + rows;
+            const lo = @max(begin, first);
+            const hi = @min(end, first + count);
+            if (lo < hi) {
+                result.slots[result.n] = slot;
+                result.rows[result.n] = @intCast(hi - lo);
+                result.n += 1;
+            }
+            begin = end;
+        }
+        return result;
+    }
+
     /// q3_prefill_dig_candidate.wave_table: slot, first row, rows, first threadgroup per expert
     /// (unused threadgroup entries INT32_MAX), then [n, threadgroups], at `bm`-row M tiles. Returns the threadgroups.
     fn table(w: *const Wave, tiles: u32, bm: u32, out: *[80]i32) u64 {
@@ -526,6 +545,40 @@ const Wave = struct {
         return @intCast(tg);
     }
 };
+
+test "exl3 mixed selfcheck: wave subsets retain slots and rebase row and tile bounds" {
+    const t = std.testing;
+    var wave: Wave = .{ .n = 4 };
+    wave.slots[0..4].* = .{ 7, 3, 0, 9 };
+    wave.rows[0..4].* = .{ 1, 127, 128, 129 };
+    for ([_]struct { first: u64, count: u64, slot: u32 }{
+        .{ .first = 0, .count = 1, .slot = 7 },
+        .{ .first = 1, .count = 127, .slot = 3 },
+        .{ .first = 128, .count = 128, .slot = 0 },
+        .{ .first = 256, .count = 129, .slot = 9 },
+    }) |case| {
+        const part = wave.subset(case.first, case.count);
+        try t.expectEqual(@as(usize, 1), part.n);
+        try t.expectEqual(case.slot, part.slots[0]);
+        try t.expectEqual(case.count, part.total());
+        var table: [80]i32 = undefined;
+        const tgs = part.table(18, 128, &table);
+        try t.expectEqual(@as(i32, 0), table[16]);
+        try t.expectEqual(@as(i32, @intCast(case.count)), table[32]);
+        try t.expectEqual(((case.count + 127) / 128) * 18, tgs);
+    }
+    const crossing = wave.subset(127, 130);
+    try t.expectEqual(@as(usize, 3), crossing.n);
+    try t.expectEqualSlices(u32, &.{ 3, 0, 9 }, crossing.slots[0..3]);
+    try t.expectEqualSlices(u32, &.{ 1, 128, 1 }, crossing.rows[0..3]);
+    var table: [80]i32 = undefined;
+    try t.expectEqual(@as(u64, 54), crossing.table(18, 128, &table));
+    try t.expectEqualSlices(i32, &.{ 0, 1, 129 }, table[16..19]);
+    try t.expectEqualSlices(i32, &.{ 0, 18, 36 }, table[48..51]);
+    try t.expectEqual(@as(i32, std.math.maxInt(i32)), table[51]);
+    try t.expectEqual(@as(i32, 3), table[64]);
+    try t.expectEqual(@as(i32, 54), table[65]);
+}
 
 fn defaultVars(e: *const Entry) Vars {
     var v: Vars = .initFill(0);
@@ -928,6 +981,15 @@ fn rowInvariance(h: *H, k: Kernel, site: ?*const xk.Site, sets: u64) !void {
                 };
                 var v2 = vars;
                 v2.set(.rows, m);
+                const subwave = wave.subset(slot, m);
+                for (e.inputs, 0..) |*arg, i| {
+                    if (arg.domain.kind != .wave_table or arg.domain.tiles == 0) continue;
+                    var table: [80]i32 = undefined;
+                    const tgs = subwave.table(arg.domain.tiles, arg.domain.bm, &table);
+                    v2.set(.experts, subwave.n);
+                    v2.set(.tgs, tgs);
+                    ins2[i] = try genInput(h, &sc2, arg, &v2, &subwave);
+                }
                 const outs = try launch(h, &sc2, k, ins2[0..e.inputs.len], &v2, siteName(site));
                 for (e.outputs, 0..) |*o, oi| {
                     const got = try hostCopy(h, outs[oi]);

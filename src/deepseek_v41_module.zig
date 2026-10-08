@@ -535,6 +535,7 @@ pub const Module = struct {
     fenced: bool = false,
     /// The native bill at the admitted rows (set by the construction check; the harnesses' phase records read it).
     bill: bill_mod.Bill = undefined,
+    bill_owned: bool = false,
     /// MLX's allocator cache limit before the module set its own (restored at deinit).
     prev_cache_limit: usize = 0,
     /// The prompt phase's MLX cache limit (set at construction; the reverse phase change restores it).
@@ -603,6 +604,7 @@ pub const Module = struct {
         const self = try gpa.create(Module);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .g = try G.init(gpa, s), .set = undefined, .exl3 = undefined, .arm = undefined, .weights = weights, .engram = undefined, .embed_rows = undefined, .model = undefined, .head = undefined };
+        errdefer if (self.bill_owned) self.bill.deinit(gpa);
         errdefer self.g.deinit();
         self.owner = std.Thread.getCurrentId();
         self.io = io;
@@ -938,12 +940,18 @@ pub const Module = struct {
         // The bill's transients on mapped pages, unmapped at the arena's end (see the admission's arenas).
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        self.bill = try bill_mod.servedBill(arena.allocator(), io, admitted, planned_wired, ceiling_bytes, self.overrides);
-        if (multiturnRoute(self.overrides)) self.turn_call = .{
-            .pb = try bill_mod.servedPrefillBill(admitted, self.overrides, &self.model.c, self.bill.variant),
+        const temporary = try bill_mod.servedBill(arena.allocator(), io, admitted, planned_wired, ceiling_bytes, self.overrides);
+        const retained = try temporary.retained(self.gpa);
+        errdefer retained.deinit(self.gpa);
+        const turn_call: ?TurnCall = if (multiturnRoute(self.overrides)) .{
+            .pb = try bill_mod.servedPrefillBill(admitted, self.overrides, &self.model.c, retained.variant),
             .layer_major = admitted.dsv41LayerMajor(),
             .joinless = bill_mod.joinlessRoute(self.overrides),
-        };
+        } else null;
+        if (self.bill_owned) self.bill.deinit(self.gpa);
+        self.bill = retained;
+        self.bill_owned = true;
+        self.turn_call = turn_call;
     }
 
     /// The construction check (the verification harnesses only, `RouteOverrides.verify`): the bill's rows against the
@@ -1044,6 +1052,7 @@ pub const Module = struct {
     pub fn deinit(self: *Module) void {
         self.recordDecodeEnd();
         const gpa = self.gpa;
+        if (self.bill_owned) self.bill.deinit(gpa);
         self.dropTurnBoundary();
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, gpa);

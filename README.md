@@ -9,16 +9,16 @@ What it contains:
 
 - the `deepseek_v41` arch: the module-owned decode state (KV lanes, Engram rows), the prompt pass in waves, the
   serial and DSpark draft decode, and the memory bill the host admits against;
-- the EXL3 quant its routed experts use (K = 2, 3 or 4 per projection, MUL1, 128-wide Hadamard with suh / svh), with Metal kernels
+- the EXL3 quant its routed experts use (K2–K5 per compact projection, MUL1, 128-wide Hadamard with suh / svh), with Metal kernels
   pinned by a manifest hash and specialised to the model's shapes (hidden 5120, intermediate 2304);
 - the expert source that streams them: the packed-record reader, the C read pool, the residency policy, and the MLX
   event gates that order reads and kernels.
 
 Decode levers that are still being evaluated ship **off by default** (see Environment switches).
 
-The model directory must have `"model_type": "deepseek_v41"` and a checked v2 streaming expert bank. The existing
-EXL3 3.0-bpw streaming package remains supported; source EXL3 safetensors repositories require a streaming repack,
-not just a config rename. Resident trunk, draft and Engram formats are unchanged. No weights are included.
+The model directory must have `"model_type": "deepseek_v41"` and a checked v2 or v3 streaming expert bank.
+The existing EXL3 3.0-bpw streaming package remains supported; source EXL3 safetensors repositories require a
+streaming repack, not just a config rename. Resident trunk, draft and Engram formats are unchanged. No weights are included.
 
 ### Expert rates and public packs
 
@@ -33,14 +33,25 @@ by each component's maximum. Enlarged page-rounded preread buffers are charged s
 Tight K3 keeps its existing kernels; K2/K4 and padded/mixed banks use direct decode and tiled prefill, not full
 BF16 expert materialization.
 
+For per-expert mixtures, `expert-manifest-v3.json` is self-contained (`format: "mtplx-expert-manifest-v3"`):
+`classes` describes each nine-segment record layout and its gate/up/down `projection_K`; `records` selects
+exactly one class, sidecar range, padded SHA256 and logical SHA256 for every layer/expert pair. Segment shapes,
+lengths, record bounds, non-overlap and complete coverage are checked before allocation. The v2 companion
+manifest is not required. Fixed v2 banks remain K2/K3/K4; compact v3 classes admit K2/K3/K4/K5.
+
+Compact caches concatenate each slot's actual code capacity instead of padding all experts to the widest rate.
+U64 descriptors carry code-word offsets and logical rates; immutable slot capacities bound every refill.
+Persistent and transient arenas, descriptor arrays, growth and construction peaks are billed from those capacities.
+Only settled slots enter the device lookup table; the missing-slot sentinel is distinct from the valid slot zero.
+
 | Published source | Expert contract | Status |
 |---|---|---|
 | [Pollard 3.5](https://huggingface.co/bot-lab-21/DeepSeek-V4.1-Flash-EXL3-3.5bpw-Pollard/tree/f129e31a81e1337aa33e129e2d847fc7e37c8733) | K3/K4 per projection; native non-expert tensors | Routed layout covered; requires a checked streaming repack. A captured K4 projection is numerically tested, not a full-pack quality evaluation. |
-| [Spark 2.77](https://huggingface.co/0xSero/DeepSeek-V4.1-Flash-Spark/tree/9e3bbeabbb39fa2cf6e37e1cecfbd2fd0290329f) | K2/K3/K5 per expert; native trunk/draft | Not admitted by this per-layer K2–K4 contract. |
+| [Spark 2.77](https://huggingface.co/0xSero/DeepSeek-V4.1-Flash-Spark/tree/9e3bbeabbb39fa2cf6e37e1cecfbd2fd0290329f) | K2/K3/K5 per expert; native trunk/draft | Compact v3 layout covered; requires a checked streaming repack selecting `exl3/plan/J268-ho-v31-K5n.json`, not the unused alternate tensors. A real K5 expert's three projections are numerically tested; no full-checkpoint boot or quality claim. |
 | [Mia 2.9](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw/tree/64ba41b6c916a587db06eae2e19b7845f7be6e6b) | K2/K3 routed layers, plus EXL3 trunk/draft | Not a drop-in checkpoint; replacing its trunk/draft would create a different model. |
 
-Advertised bpw is an average, not a decoder rate or codec. MCG, fractional rates and per-expert mixtures are not
-covered by this contract.
+Advertised bpw is an average, not a decoder rate or codec. Spark 2.77 is the near-2.8 candidate checked here.
+MCG, fractional decoder rates, K6–K8 and EXL3 trunk/draft tensors remain unsupported.
 
 ## How mlx-serve consumes it
 
@@ -60,7 +71,7 @@ The plugin builds only inside a host. This repo's `build.zig` runs the host's bu
 `-Dmlx-stream-dir=<this checkout>` (default host: `../mlx-serve`, or pass `-Dmlx-serve=/path`):
 
 ```sh
-zig build test -Dmlx-serve=../mlx-serve         # the plugin's tests (the host's mlx-stream-test step)
+zig build test -Dmlx-serve=../mlx-serve         # host plugin tests plus the SDK memory-bill tests
 zig build conformance -Dmlx-serve=../mlx-serve  # the plugin conformance suite (CPU lane, no device)
 zig build refusals -Dmlx-serve=../mlx-serve     # the sdk_ext contracts' compile-time refusals (compile only)
 zig build serve -Dmlx-serve=../mlx-serve        # the host's ReleaseFast server with this plugin
@@ -68,6 +79,8 @@ zig build serve -Dmlx-serve=../mlx-serve        # the host's ReleaseFast server 
 
 From the host checkout the suites are `zig build mlx-stream-test` (part of `zig build test`) and
 `zig build mlx-stream-conformance`.
+The standalone build defaults to ReleaseFast and forwards `-Doptimize` to the host. The SDK's owned, bounded
+row-cost table is tested separately because Zig does not collect tests through a foreign module import.
 
 `scripts/test_dsv41.sh` runs every `dsv41 ` test of the plugin and the host on the CPU, and adds the bank tests when
 `DSV41_BANK` is set. The test suites pin MLX to the CPU (`MLX_DEFAULT_DEVICE=cpu`). The tests that load the full model
@@ -175,7 +188,7 @@ if GPU testing is requested but their required assets are missing.
 
 Run the host's `mlx-stream-test` and `mlx-stream-conformance` targets with `-Doptimize=ReleaseFast` and
 `-Dmlx-stream-dir=/path/to/checkout`. Inline regressions cover malformed manifests, logical/physical strides,
-nonzero cache slots across growth/shrink/reuse, component-max bills, and actual K4 preread/scatter.
+nonzero cache slots across growth/shrink/reuse, compact class capacities, owned bills, source identity, and actual preread/scatter.
 
 Build the standalone test binary with `test-build -Dtest-filter="dsv41 kernels ops gpu:"`, then run it with
 `DSV41_KERNELS_GPU=1`, `SUSHI_EXL3_K2_FIXTURE`, `SUSHI_EXL3_K3_FIXTURE` and `SUSHI_EXL3_K4_FIXTURE` pointing to
@@ -187,7 +200,66 @@ routed forms and carried BF16 prefill against independent public weights; report
 The Pollard capture is the four unchanged `layers.0.ffn.experts.0.w2.{trellis,suh,svh,mul1}` tensors from
 `model-00003-of-00048.safetensors` at the revision linked above; it is a tensor extraction, not a requantization.
 For the manifest's compile and numerical probes, build with `-Dtest-filter="dsv41 pre-ship gate:"` and run the
-standalone binary with `DSV41_SELFCHECK_DEVICE=1`. This includes the integer-rate kernels, not just K3 construction.
+standalone binary with `DSV41_SELFCHECK_DEVICE=1`. This includes integer-rate and compact kernels, not just K3 construction.
+
+For compact numerical checks, build `test-build -Dtest-filter="exl3 mixed"` and run the standalone binary with
+the GPU and K2/K3/K4 variables above, plus `SUSHI_EXL3_K5_FIXTURE` and `DSV41_SPARK_K5_REFERENCE`. These name
+`exl3_k5_linear.safetensors` and `spark-k5-reference.safetensors` produced by
+`scripts/capture_exl3_cpu_reference.py --reference-root PATH --calibration-fixtures PATH --sample PATH --output PATH`.
+The sample contains Spark layer-0/expert-2's unchanged `w1`, `w3` and `w2` trellis/scales/MUL1 tensors and must
+match SHA256 `d7db53973044421de435e62901243205ba0e1868fb0056bd5da19673db0af014`.
+The oracle is the unmodified [PonyExl3 CPU reference](https://github.com/beamivalice/PonyExl3/tree/8e7fa6b1556f59fc669e25087903b279b9b0346f),
+not mlx-stream output or an ExLlamaV3 CUDA capture. It first checks all 65,536 MUL1 entries and calibrates against
+Sushi's K2/K3/K4 fixtures; the receipt records library, input, output and comparison-policy provenance.
+
+The compact GPU gate covers K2–K5 mixtures, all three banks, carried BF16 waves across 128-row boundaries,
+poisoned missing slots, a full real K5 expert and code addresses beyond 4 GiB. Its prefill reference independently
+models the FP16 transformed-activation stores before accumulation; decode uses the external public weights.
+Nonfinite reference values are rejected. Device-disabled tests skip; enabling the compact GPU gate requires
+its assets, and missing assets fail rather than count as numerical passes.
+
+Run the capture tool's tests with `python3 scripts/test_capture_exl3_cpu_reference.py`. Set
+`PONY_EXL3_REFERENCE`, `SUSHI_EXL3_FIXTURES` and `DSV41_SPARK_K5_SAMPLE` to exercise the real capture pipeline,
+including corrupted reference/trellis/scale rejection; without all three inputs the integration cases cannot pass.
+
+To reproduce the pinned sample, download `exl3/qn/K5/L00.part.safetensors` from the Spark revision linked above,
+then extract only the unchanged reference tensors below. This creates a test fixture, not a streaming pack;
+the canonical container encoding makes the sample hash reproducible without depending on a safetensors writer version.
+
+```sh
+python3 - /path/to/L00.part.safetensors /path/to/sample.safetensors <<'PY'
+import hashlib, json, struct, sys
+from pathlib import Path
+
+header = {"__metadata__": {
+    "source_repo": "0xSero/DeepSeek-V4.1-Flash-Spark",
+    "source_revision": "9e3bbeabbb39fa2cf6e37e1cecfbd2fd0290329f",
+    "source_shard": "exl3/qn/K5/L00.part.safetensors",
+    "layer": "0", "expert": "2", "rate": "5",
+}}
+chunks, offset = [], 0
+with Path(sys.argv[1]).open("rb") as source:
+    size = struct.unpack("<Q", source.read(8))[0]
+    tensors = json.loads(source.read(size))
+    for projection in ("w1", "w2", "w3"):
+        for component in ("mul1", "suh", "svh", "trellis"):
+            name = f"layers.0.ffn.experts.2.{projection}.{component}"
+            tensor = tensors[name]
+            lo, hi = tensor["data_offsets"]
+            source.seek(8 + size + lo)
+            data = source.read(hi - lo)
+            header[name] = {"dtype": tensor["dtype"], "shape": tensor["shape"],
+                            "data_offsets": [offset, offset + len(data)]}
+            chunks.append(data)
+            offset += len(data)
+encoded = json.dumps(header, separators=(",", ":")).encode()
+encoded += b" " * (-len(encoded) % 8)
+blob = struct.pack("<Q", len(encoded)) + encoded + b"".join(chunks)
+if hashlib.sha256(blob).hexdigest() != "d7db53973044421de435e62901243205ba0e1868fb0056bd5da19673db0af014":
+    raise ValueError("selected Spark tensors do not match the pinned sample")
+Path(sys.argv[2]).write_bytes(blob)
+PY
+```
 
 Kernel-ops and prefill-wave replay metadata is now v2, with explicit logical rates and physical row strides.
 For existing K3 fixtures, run `python3 scripts/migrate_exl3_fixture_layouts.py old-spec.json spec.json` in the
@@ -211,7 +283,7 @@ Hadamard with suh / svh). They are independent implementations with disjoint cla
 |---|---|---|
 | Model | `qwen4_exp` (`quantization_config.expert_quant`) | `deepseek_v41` (inside the arch) |
 | Expert banks | resident | streamed from SSD as packed per-expert records |
-| Rates | K 2..4, mixes, mul1 and mcg | K 2..4 per layer/projection, mul1 |
+| Rates | K 2..4, mixes, mul1 and mcg | fixed K2–K4; compact K2–K5 per expert/projection, mul1 |
 | Kernels | generated for any shape | pinned Metal texts for this model's shapes, behind a manifest hash |
 
 `src/exl3_sushi_parity.zig` checks the independent public K2/K3/K4 MUL1 fixtures, including full H128 and scales.

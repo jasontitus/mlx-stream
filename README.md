@@ -85,6 +85,9 @@ row-cost table is tested separately because Zig does not collect tests through a
 `scripts/test_dsv41.sh` runs every `dsv41 ` test of the plugin and the host on the CPU, and adds the bank tests when
 `DSV41_BANK` is set. The test suites pin MLX to the CPU (`MLX_DEFAULT_DEVICE=cpu`). The tests that load the full model
 or run on the GPU skip unless their own inputs are given.
+Bank header checks are independent of shard grouping. Optional `DSV41_M0_FIXTURE` checks compare tensor dtypes,
+shapes and payload hashes, not filenames or offsets; the fixture must match the checkpoint's tensor bytes.
+The real-bank EXL3 admission test checks the manifest against the runtime decoder contract without loading the model.
 
 ## Memory and context length
 

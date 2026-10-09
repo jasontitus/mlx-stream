@@ -1848,7 +1848,7 @@ test "exl3 mixed storage: every selected class is admitted and owned after peek 
     try testing.expectError(error.RouteInput, acc.checkLayerBank(&g, 0, bank, &diag));
 }
 
-test "dsv41 kernels c2: the real 3.0 bank's own manifest is claimed (DSV41_BANK)" {
+test "dsv41 kernels c2: the real bank's own manifest is claimed (DSV41_BANK)" {
     const dir = std.mem.span(std.c.getenv("DSV41_BANK") orelse return error.SkipZigTest);
     var bd: expert_bank.Diag = .{};
     var p = expert_bank.peek(testing.allocator, std.testing.io, dir, &bd) catch |e| {
@@ -1857,7 +1857,10 @@ test "dsv41 kernels c2: the real 3.0 bank's own manifest is claimed (DSV41_BANK)
     };
     defer p.deinit();
     var why: Diag = .{};
-    try testing.expectEqual(@as(?quant.Priority, .native), claims(&p.view, &why));
+    testing.expectEqual(@as(?quant.Priority, .native), claims(&p.view, &why)) catch |err| {
+        std.debug.print("quant refused: {s}\n", .{why.message()});
+        return err;
+    };
 }
 
 test "dsv41 kernels c2: the load's peek streams the bank's description past the page cache, as the text peek reads it" {

@@ -1178,6 +1178,20 @@ METAL_FUNC uint rate_window(const device uint* tile, uint position) {
     return ((lo >> (32u - used)) | (hi << used)) & 0xffffu;
 }
 
+// The windows of job positions q and q + 1 (q = the offset in the job's 32 positions) from one 16 + K bit read x
+// ending at stream bit (q + 2) K: v[1] = its low 16 bits, v[0] = the 16 bits K higher. W = the job's words, W[0] =
+// word c7 K - 1, so the job's bit offsets, and every shift here, are the same constants for each c7.
+template <int K, int Q>
+METAL_FUNC void rate_pair(thread const uint* W, thread half* v) {
+    constexpr uint end = 32u + uint(Q + 2) * K;
+    constexpr uint wi = (end - 1u) / 32u;
+    constexpr uint used = end - 32u * wi;
+    uint x = W[wi] >> (32u - used);
+    if constexpr (used < 16u + K) x |= W[wi - 1u] << used;
+    v[1] = dig_cb(x & 0xffffu);
+    v[0] = dig_cb((x >> uint(K)) & 0xffffu);
+}
+
 template <int K, int H>
 METAL_FUNC void rate_dec_job(const device uint* tile, uint c7, threadgroup half* dst) {
     if constexpr (K == 3) {
@@ -1185,11 +1199,30 @@ METAL_FUNC void rate_dec_job(const device uint* tile, uint c7, threadgroup half*
             (3u * c7 + 24u) % 24u, (3u * c7 + 25u) % 24u,
             (3u * c7 + 26u) % 24u, dst);
     } else {
+        // The job reads stream bits (32 c7 + 4 H + 1) K - 16 .. (32 c7 + 4 H + 28) K - 1, inside words
+        // c7 K - 1 .. c7 K + K - 1: W[i] = word c7 K - 1 + i, loaded once. Only W[0] wraps (c7 = 0), and H = 1
+        // at K >= 4 never reads it.
+        constexpr uint first = (16u + uint(4 * H + 1) * K) / 32u;
+        const uint base = c7 * uint(K);
+        uint W[K + 1];
+        if constexpr (first == 0u) W[0] = tile[c7 != 0u ? base - 1u : 8u * K - 1u];
         STEEL_PRAGMA_UNROLL
-        for (uint r = 0; r < 16u; ++r) {
-            const uint lane = 4u * c7 + (r & 7u) / 2u;
-            const uint p = 8u * lane + (r & 1u) + (r >= 8u ? 2u : 0u) + 4u * H;
-            dst[r] = dig_cb(rate_window<K>(tile, p));
+        for (uint i = 1; i <= uint(K); ++i) {
+            W[i] = tile[base + i - 1u];
         }
+        half v[16];
+        rate_pair<K, 4 * H + 0>(W, v + 0);
+        rate_pair<K, 4 * H + 8>(W, v + 2);
+        rate_pair<K, 4 * H + 16>(W, v + 4);
+        rate_pair<K, 4 * H + 24>(W, v + 6);
+        rate_pair<K, 4 * H + 2>(W, v + 8);
+        rate_pair<K, 4 * H + 10>(W, v + 10);
+        rate_pair<K, 4 * H + 18>(W, v + 12);
+        rate_pair<K, 4 * H + 26>(W, v + 14);
+        threadgroup uint4* d4 = reinterpret_cast<threadgroup uint4*>(dst);
+        d4[0] = uint4(dig_pk<half>(v[0], v[1]), dig_pk<half>(v[2], v[3]),
+            dig_pk<half>(v[4], v[5]), dig_pk<half>(v[6], v[7]));
+        d4[1] = uint4(dig_pk<half>(v[8], v[9]), dig_pk<half>(v[10], v[11]),
+            dig_pk<half>(v[12], v[13]), dig_pk<half>(v[14], v[15]));
     }
 }

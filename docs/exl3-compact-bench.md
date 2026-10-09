@@ -32,7 +32,8 @@ effects are real; combining winners is a separate step (below).
 | `opt/prefill-prefetch` | prefill | on top of wordcache: each lane loads stage s+1's code words before stage s's matmul | no | agent running |
 | `opt/prefill-per-k` | prefill | compile-time-K GEMM variants; the wave is split by rate and each variant launched once | yes | agent running |
 | `opt/prefill-staged-words` | prefill | the stage's 16 tiles are copied to threadgroup memory with coalesced loads, decoded from there | no | agent running (expected to lose; built so the benchmark decides) |
-| `opt/decode-wordcache` | decode | K dispatch hoisted out of the tk loop; K2/K4/K5 lanes load 2-3 words per tile and funnel-shift | no | agent running |
+| `opt/decode-hoist` | decode | K dispatch hoisted out of the tk loop only; K2/K4/K5 windows still read one at a time. Isolates the dispatch / register effect. | no | pushed; CPU harness bit-identical (20 kernel cases, 1.07M outputs) |
+| `opt/decode-wordcache` | decode | the hoist plus a per-lane word cache: K2/K4/K5 lanes load 2 words per tile (3 for K5) and funnel-shift them, like the K3 path. Also covers the fixed-rate `_rate_` decode kernels. | no | pushed; same harness, bit-identical |
 | `opt/decode-per-k` | decode | one compile-time-K launch per rate present; other threadgroups exit early | yes | agent running |
 | `opt/decode-staged-x` | decode | 4 simdgroups per threadgroup share the activation row staged in threadgroup memory; K hoisted | no (manifest geometry) | agent running |
 
@@ -103,7 +104,7 @@ All non-per-k branches in one invocation so they share codes, clocks and thermal
 python3 scripts/bench_exl3_compact.py \
     opt/exl3-compact-tools \
     opt/prefill-wordcache opt/prefill-prefetch opt/prefill-staged-words \
-    opt/decode-wordcache opt/decode-staged-x \
+    opt/decode-hoist opt/decode-wordcache opt/decode-staged-x \
     --mix-from <spark-repack>/expert-manifest-v3.json \
     --rows 1,8,48 --json bench-$(date +%Y%m%d-%H%M).json
 ```
@@ -137,7 +138,7 @@ How to read it:
 - **output** - `exact` or `DIFF`. A `DIFF` is a bug in the candidate even if it is fast.
 
 Keep the branch with the best `rows=1` decode time and the best prefill time for the Spark mix, provided it is
-`exact`. If `opt/decode-staged-x` and `opt/decode-wordcache` both beat the baseline, they are independent effects
+`exact`. `opt/decode-wordcache` contains `opt/decode-hoist`'s change, so their difference is the word cache alone; if `opt/decode-staged-x` and `opt/decode-wordcache` both beat the baseline, they are independent effects
 (activation traffic vs. code extraction) and worth composing; `opt/prefill-prefetch` already contains
 `opt/prefill-wordcache`, so compare the two directly.
 

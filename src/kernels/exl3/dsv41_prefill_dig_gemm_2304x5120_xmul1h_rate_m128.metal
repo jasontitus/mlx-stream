@@ -68,32 +68,9 @@
     const bool full = sgp_sm == SM;
     NAXTile<float, TM, TN> Dtile;
     Dtile.clear();
-    for (int s = 0; s < S; ++s) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        STEEL_PRAGMA_UNROLL
-        for (int jj = 0; jj < JOBS; ++jj) {
-            const device uint* tile = cd + size_t(s) * size_t(KT * N16 * WPT) + src_off[jj];
-                if (h != 0u) rate_dec_job<K, 1>(tile, c7, Bs + dst_off[jj]);
-                else rate_dec_job<K, 0>(tile, c7, Bs + dst_off[jj]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sgp_sm > 0) {
-            STEEL_PRAGMA_NO_UNROLL
-            for (int i = 0; i < 2; ++i) {
-                NAXTile<half, TM, TK> Atile;
-                NAXTile<half, TN, TK> Btile;
-                volatile int compiler_barrier;
-                if (full) {
-                    Atile.load(xa + s * BK + i * SK, KD);
-                } else {
-                    Atile.load_safe(xa + s * BK + i * SK, KD, short2(SK, sgp_sm));
-                }
-                Btile.template load<half, LDB, 1>(Bs + tn * LDB + i * SK);
-                tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});
-                (void)compiler_barrier;
-            }
-        }
-    }
+    // stages: decode + matmul per BK, with the next stage's code words loaded ahead of the matmul
+    // (rate_gemm_stages); K is uniform per threadgroup, so it is dispatched here, once
+    rate_gemm_stages<K, KD, ND, JOBS>(cd, src_off, dst_off, c7, h, Bs, xa, sgp_sm, tn, Dtile);
     if (sgp_sm > 0) {
         device float* zp = z0 + (size_t(row0) + size_t(m0 + tm)) * size_t(ND) + n0 + tn;
         if (full) {

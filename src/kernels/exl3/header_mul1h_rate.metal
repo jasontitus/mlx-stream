@@ -1192,25 +1192,37 @@ METAL_FUNC void rate_pair(thread const uint* W, thread half* v) {
     v[0] = dig_cb((x >> uint(K)) & 0xffffu);
 }
 
+// One 16-weight job of a 16 x 16 trellis tile at rate K (column c = 8 H + c7), split so a GEMM can issue the
+// device loads of a job ahead of its decode: rate_load_job -> the job's words W (K + 1 uints), rate_decode_job ->
+// the 16 consecutive K slots of B^T row n at `dst` (two 16-byte stores). rate_dec_job = the two in sequence.
+//   K = 3: W = dig_dec_job's words o_t = (3 c7 + 23 + t) mod 24, decoded by dig_windows<H>.
+//   K != 3: the job reads stream bits (32 c7 + 4 H + 1) K - 16 .. (32 c7 + 4 H + 28) K - 1, inside words
+//   c7 K - 1 .. c7 K + K - 1: W[i] = word c7 K - 1 + i, loaded once. Only W[0] wraps (c7 = 0), and H = 1 at K >= 4
+//   never reads it (not loaded).
 template <int K, int H>
-METAL_FUNC void rate_dec_job(const device uint* tile, uint c7, threadgroup half* dst) {
+METAL_FUNC void rate_load_job(const device uint* tile, uint c7, thread uint* W) {
     if constexpr (K == 3) {
-        dig_dec_job<half, H>(tile, (3u * c7 + 23u) % 24u,
-            (3u * c7 + 24u) % 24u, (3u * c7 + 25u) % 24u,
-            (3u * c7 + 26u) % 24u, dst);
+        W[0] = tile[(3u * c7 + 23u) % 24u];
+        W[1] = tile[(3u * c7 + 24u) % 24u];
+        W[2] = tile[(3u * c7 + 25u) % 24u];
+        W[3] = tile[(3u * c7 + 26u) % 24u];
     } else {
-        // The job reads stream bits (32 c7 + 4 H + 1) K - 16 .. (32 c7 + 4 H + 28) K - 1, inside words
-        // c7 K - 1 .. c7 K + K - 1: W[i] = word c7 K - 1 + i, loaded once. Only W[0] wraps (c7 = 0), and H = 1
-        // at K >= 4 never reads it.
         constexpr uint first = (16u + uint(4 * H + 1) * K) / 32u;
         const uint base = c7 * uint(K);
-        uint W[K + 1];
         if constexpr (first == 0u) W[0] = tile[c7 != 0u ? base - 1u : 8u * K - 1u];
         STEEL_PRAGMA_UNROLL
         for (uint i = 1; i <= uint(K); ++i) {
             W[i] = tile[base + i - 1u];
         }
-        half v[16];
+    }
+}
+
+template <int K, int H>
+METAL_FUNC void rate_decode_job(thread const uint* W, threadgroup half* dst) {
+    half v[16];
+    if constexpr (K == 3) {
+        dig_windows<H>(W, v);
+    } else {
         rate_pair<K, 4 * H + 0>(W, v + 0);
         rate_pair<K, 4 * H + 8>(W, v + 2);
         rate_pair<K, 4 * H + 16>(W, v + 4);
@@ -1219,10 +1231,80 @@ METAL_FUNC void rate_dec_job(const device uint* tile, uint c7, threadgroup half*
         rate_pair<K, 4 * H + 10>(W, v + 10);
         rate_pair<K, 4 * H + 18>(W, v + 12);
         rate_pair<K, 4 * H + 26>(W, v + 14);
-        threadgroup uint4* d4 = reinterpret_cast<threadgroup uint4*>(dst);
-        d4[0] = uint4(dig_pk<half>(v[0], v[1]), dig_pk<half>(v[2], v[3]),
-            dig_pk<half>(v[4], v[5]), dig_pk<half>(v[6], v[7]));
-        d4[1] = uint4(dig_pk<half>(v[8], v[9]), dig_pk<half>(v[10], v[11]),
-            dig_pk<half>(v[12], v[13]), dig_pk<half>(v[14], v[15]));
+    }
+    threadgroup uint4* d4 = reinterpret_cast<threadgroup uint4*>(dst);
+    d4[0] = uint4(dig_pk<half>(v[0], v[1]), dig_pk<half>(v[2], v[3]),
+        dig_pk<half>(v[4], v[5]), dig_pk<half>(v[6], v[7]));
+    d4[1] = uint4(dig_pk<half>(v[8], v[9]), dig_pk<half>(v[10], v[11]),
+        dig_pk<half>(v[12], v[13]), dig_pk<half>(v[14], v[15]));
+}
+
+template <int K, int H>
+METAL_FUNC void rate_dec_job(const device uint* tile, uint c7, threadgroup half* dst) {
+    uint W[K + 1];
+    rate_load_job<K, H>(tile, c7, W);
+    rate_decode_job<K, H>(W, dst);
+}
+
+// The stage loop of the m128 prefill GEMMs (BM 128, BN 64, BK 64, 8 simdgroups of SM x SN = 32 x 32, JOBS decode
+// jobs per lane per stage; cd = the N tile's first stage, xa = the simdgroup's A rows) at one rate K, so the K
+// dispatch is made once per threadgroup, outside the loop. Software pipelined: a lane's code words for stage s + 1
+// are loaded before stage s's matmul and decoded after the next barrier, so their device latency overlaps the matmul
+// instead of being exposed at the top of every stage. Same decode arithmetic (rate_dec_job) and tile_matmad_nax
+// sequence as the unpipelined loop; W (K + 1 uints per job) stays live across the matmul.
+template <int K, int KD, int ND, int JOBS>
+METAL_FUNC void rate_gemm_stages(const device uint* cd, thread const int* src_off, thread const int* dst_off,
+    uint c7, uint h, threadgroup half* Bs, const device half* xa, int sgp_sm, short tn,
+    thread NAXTile<float, 2, 2>& Dtile) {
+    constexpr int BK = 64;
+    constexpr int SM = 32;
+    constexpr int SK = 32;
+    constexpr int TM = 2;
+    constexpr int TN = 2;
+    constexpr int TK = 2;
+    constexpr int LDB = BK + 8;
+    constexpr int KT = BK / 16;
+    constexpr int N16 = ND / 16;
+    constexpr int WPT = 8 * K;
+    constexpr int S = KD / BK;
+    const bool full = sgp_sm == SM;
+    uint W[JOBS][K + 1];
+    STEEL_PRAGMA_UNROLL
+    for (int jj = 0; jj < JOBS; ++jj) {
+        if (h != 0u) rate_load_job<K, 1>(cd + src_off[jj], c7, W[jj]);
+        else rate_load_job<K, 0>(cd + src_off[jj], c7, W[jj]);
+    }
+    for (int s = 0; s < S; ++s) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        STEEL_PRAGMA_UNROLL
+        for (int jj = 0; jj < JOBS; ++jj) {
+            if (h != 0u) rate_decode_job<K, 1>(W[jj], Bs + dst_off[jj]);
+            else rate_decode_job<K, 0>(W[jj], Bs + dst_off[jj]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (s + 1 < S) {
+            STEEL_PRAGMA_UNROLL
+            for (int jj = 0; jj < JOBS; ++jj) {
+                const device uint* tile = cd + size_t(s + 1) * size_t(KT * N16 * WPT) + src_off[jj];
+                if (h != 0u) rate_load_job<K, 1>(tile, c7, W[jj]);
+                else rate_load_job<K, 0>(tile, c7, W[jj]);
+            }
+        }
+        if (sgp_sm > 0) {
+            STEEL_PRAGMA_NO_UNROLL
+            for (int i = 0; i < 2; ++i) {
+                NAXTile<half, TM, TK> Atile;
+                NAXTile<half, TN, TK> Btile;
+                volatile int compiler_barrier;
+                if (full) {
+                    Atile.load(xa + s * BK + i * SK, KD);
+                } else {
+                    Atile.load_safe(xa + s * BK + i * SK, KD, short2(SK, sgp_sm));
+                }
+                Btile.template load<half, LDB, 1>(Bs + tn * LDB + i * SK);
+                tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});
+                (void)compiler_barrier;
+            }
+        }
     }
 }

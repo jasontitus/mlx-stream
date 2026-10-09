@@ -1193,3 +1193,65 @@ METAL_FUNC void rate_dec_job(const device uint* tile, uint c7, threadgroup half*
         }
     }
 }
+
+// ---- decode lane windows (compact/rate GEMV) ----
+// Option A ("hoist"): the per-expert K dispatch moves outside the tk loop; K = 3 keeps the K3 kernels' two-word
+// extraction, K = 2 / 4 / 5 still gather each window with rate_window<K> (one or two loads per window).
+struct gemv_lane_plan {
+    uint a;     // K3: word holding stream bit E - 1 (E = 24 (lane + 1))
+    uint b;     // K3: the word before a (circular)
+    uint r;     // K3: right shift putting stream bit E - 1 at bit 0 (0, 8, 16, 24)
+    uint p7;    // 8 lane + 7: window m reads position p7 - m
+};
+
+// depends on lane and K only: computed once, outside the tk loop
+template <int K>
+METAL_FUNC gemv_lane_plan gemv_lane_plan_of(uint lane) {
+    constexpr uint words = 8u * K;
+    const uint e1 = 8u * K * (lane + 1u) - 1u;
+    gemv_lane_plan pl;
+    pl.a = e1 >> 5u;
+    pl.b = (pl.a + words - 1u) % words;
+    pl.r = 31u - (e1 & 31u);
+    pl.p7 = 8u * lane + 7u;
+    return pl;
+}
+
+// the lane's 8 windows of one tile, win[m] = rate_window<K>(tile, 8 lane + 7 - m)
+template <int K>
+METAL_FUNC void gemv_lane_windows(const device uint* tile, gemv_lane_plan pl, thread uint* win) {
+    for (uint m = 0; m < 8u; ++m) win[m] = rate_window<K>(tile, pl.p7 - m);
+}
+
+template <>
+METAL_FUNC void gemv_lane_windows<3>(const device uint* tile, gemv_lane_plan pl, thread uint* win) {
+    // the K3 kernels' extraction (rd8 = word a, rd9 = word b, lp = r): windows 0..5 end at bit 31 at most, 6..7 need
+    // bits 18..40; lp is one of (0, 8, 16, 24)
+    const uint rd8 = tile[pl.a];
+    const uint rd9 = tile[pl.b];
+    const uint lp = pl.r;
+    const uint v0 = (lp == 0u) ? rd8 : ((rd8 >> lp) | (rd9 << (32u - lp)));      // bits 0..31 of v
+    const uint v1 = (lp < 16u) ? ((rd8 >> (lp + 16u)) | (rd9 << (16u - lp)))     // bits 16..47 of v
+                               : (rd9 >> (lp - 16u));
+    for (uint m = 0; m < 6u; ++m) win[m] = (v0 >> (3u * m)) & 0xffffu;
+    for (uint m = 6u; m < 8u; ++m) win[m] = (v1 >> (3u * m - 16u)) & 0xffffu;
+}
+
+// The decode GEMV k loop at a compile-time rate K: TILES k-tiles (tile (tk, tn) at base + (tk COLS + tn) 16 K shorts),
+// acc[m] += x[tk 16 + dr[m]] * w_m in tk order, exactly as the K3 kernels accumulate.  Callers with a per-expert K
+// dispatch to one instance per threadgroup, so each instance keeps only its own plan and words live.
+template <int K, uint TILES, uint COLS, uint UNROLL>
+METAL_FUNC void gemv_rate_loop(const device short* base, const device float* xp, uint tn, uint lane,
+                               thread const uint* dr, thread float* acc) {
+    const gemv_lane_plan pl = gemv_lane_plan_of<K>(lane);
+    #pragma clang loop unroll_count(UNROLL)
+    for (uint tk = 0; tk < TILES; ++tk) {
+        const device short* tile = base + (tk * COLS + tn) * (16u * K);
+        uint win[8];
+        gemv_lane_windows<K>(reinterpret_cast<const device uint*>(tile), pl, win);
+        for (uint m = 0; m < 8u; ++m) {
+            const float w = float(dig_cb(win[m]));
+            acc[m] = metal::fma(xp[tk * 16u + dr[m]], w, acc[m]);
+        }
+    }
+}

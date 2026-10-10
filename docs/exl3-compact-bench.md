@@ -29,7 +29,7 @@ effects are real; combining winners is a separate step (below).
 |---|---|---|---|---|
 | `opt/exl3-compact-tools` | - | baseline: current kernels + the two scripts | no | pushed |
 | `opt/prefill-wordcache` | prefill | `rate_dec_job` for K != 3 loads its K (or K+1) words once, extracts with compile-time shifts, stores two `uint4` instead of 16 halves. The fixed-rate `_rate_m128` kernels share the helper and gain too. | no | pushed; CPU harness bit-identical (K2-K5, both halves, all columns, ~350k jobs per K) |
-| `opt/prefill-prefetch` | prefill | on top of wordcache: each lane loads stage s+1's code words before stage s's matmul | no | agent running |
+| `opt/prefill-prefetch` | prefill | on top of wordcache: each lane loads stage s+1's code words before stage s's matmul (+3..6 live registers). Also restructures the fixed-rate `_rate_m128` GEMMs. | no | pushed; CPU harness bit-identical at the Bs level and the 256-thread stage loop's read schedule (K2-K5, both shapes, 3 row counts) |
 | `opt/prefill-per-k` | prefill | compile-time-K GEMM variants; the wave is split by rate and each variant launched once | yes | agent running |
 | `opt/prefill-staged-words` | prefill | the stage's 16 tiles are copied to threadgroup memory with coalesced loads, decoded from there | no | agent running (expected to lose; built so the benchmark decides) |
 | `opt/decode-hoist` | decode | K dispatch hoisted out of the tk loop only; K2/K4/K5 windows still read one at a time. Isolates the dispatch / register effect. | no | pushed; CPU harness bit-identical (20 kernel cases, 1.07M outputs) |

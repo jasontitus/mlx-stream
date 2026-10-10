@@ -1149,6 +1149,17 @@ METAL_FUNC void dig_windows<1>(thread const uint* P, thread half* v) {
     v[15] = dig_cb(x & 0xffffu); v[14] = dig_cb((x >> 3u) & 0xffffu); }
 }
 
+// one 16-weight job from its 4 words P (dig_dec_job's P) -> the 16 consecutive K slots of B^T row n at `dst`
+// (two 16-byte stores)
+template <typename T, int H>
+METAL_FUNC void dig_dec_words(thread const uint* P, threadgroup T* dst) {
+  half v[16];
+  dig_windows<H>(P, v);
+  threadgroup uint4* d4 = reinterpret_cast<threadgroup uint4*>(dst);
+  d4[0] = uint4(dig_pk<T>(v[0], v[1]), dig_pk<T>(v[2], v[3]), dig_pk<T>(v[4], v[5]), dig_pk<T>(v[6], v[7]));
+  d4[1] = uint4(dig_pk<T>(v[8], v[9]), dig_pk<T>(v[10], v[11]), dig_pk<T>(v[12], v[13]), dig_pk<T>(v[14], v[15]));
+}
+
 // one 16-weight job: column c = 8 H + c7 of a 16 x 16 trellis tile (24 u32 words at `tile`; o_t = the words
 // (3 c7 + 23 + t) mod 24) -> the 16 consecutive K slots of B^T row n at `dst` (two 16-byte stores)
 template <typename T, int H>
@@ -1158,11 +1169,7 @@ METAL_FUNC void dig_dec_job(const device uint* tile, uint o0, uint o1, uint o2, 
   P[1] = tile[o1];
   P[2] = tile[o2];
   P[3] = tile[o3];
-  half v[16];
-  dig_windows<H>(P, v);
-  threadgroup uint4* d4 = reinterpret_cast<threadgroup uint4*>(dst);
-  d4[0] = uint4(dig_pk<T>(v[0], v[1]), dig_pk<T>(v[2], v[3]), dig_pk<T>(v[4], v[5]), dig_pk<T>(v[6], v[7]));
-  d4[1] = uint4(dig_pk<T>(v[8], v[9]), dig_pk<T>(v[10], v[11]), dig_pk<T>(v[12], v[13]), dig_pk<T>(v[14], v[15]));
+  dig_dec_words<T, H>(P, dst);
 }
 
 // A circular 16-bit window ending at (position + 1) K; words retain EXL3's bit order.
@@ -1192,6 +1199,26 @@ METAL_FUNC void rate_pair(thread const uint* W, thread half* v) {
     v[0] = dig_cb((x >> uint(K)) & 0xffffu);
 }
 
+// The 16 halves of a rate-K job (K != 3) from its K + 1 words W (rate_dec_job's W; W[0] = word c7 K - 1, unread
+// for H = 1 at K >= 4) -> B^T row n at `dst` (two 16-byte stores).
+template <int K, int H>
+METAL_FUNC void rate_dec_words(thread const uint* W, threadgroup half* dst) {
+    half v[16];
+    rate_pair<K, 4 * H + 0>(W, v + 0);
+    rate_pair<K, 4 * H + 8>(W, v + 2);
+    rate_pair<K, 4 * H + 16>(W, v + 4);
+    rate_pair<K, 4 * H + 24>(W, v + 6);
+    rate_pair<K, 4 * H + 2>(W, v + 8);
+    rate_pair<K, 4 * H + 10>(W, v + 10);
+    rate_pair<K, 4 * H + 18>(W, v + 12);
+    rate_pair<K, 4 * H + 26>(W, v + 14);
+    threadgroup uint4* d4 = reinterpret_cast<threadgroup uint4*>(dst);
+    d4[0] = uint4(dig_pk<half>(v[0], v[1]), dig_pk<half>(v[2], v[3]),
+        dig_pk<half>(v[4], v[5]), dig_pk<half>(v[6], v[7]));
+    d4[1] = uint4(dig_pk<half>(v[8], v[9]), dig_pk<half>(v[10], v[11]),
+        dig_pk<half>(v[12], v[13]), dig_pk<half>(v[14], v[15]));
+}
+
 template <int K, int H>
 METAL_FUNC void rate_dec_job(const device uint* tile, uint c7, threadgroup half* dst) {
     if constexpr (K == 3) {
@@ -1210,19 +1237,59 @@ METAL_FUNC void rate_dec_job(const device uint* tile, uint c7, threadgroup half*
         for (uint i = 1; i <= uint(K); ++i) {
             W[i] = tile[base + i - 1u];
         }
-        half v[16];
-        rate_pair<K, 4 * H + 0>(W, v + 0);
-        rate_pair<K, 4 * H + 8>(W, v + 2);
-        rate_pair<K, 4 * H + 16>(W, v + 4);
-        rate_pair<K, 4 * H + 24>(W, v + 6);
-        rate_pair<K, 4 * H + 2>(W, v + 8);
-        rate_pair<K, 4 * H + 10>(W, v + 10);
-        rate_pair<K, 4 * H + 18>(W, v + 12);
-        rate_pair<K, 4 * H + 26>(W, v + 14);
-        threadgroup uint4* d4 = reinterpret_cast<threadgroup uint4*>(dst);
-        d4[0] = uint4(dig_pk<half>(v[0], v[1]), dig_pk<half>(v[2], v[3]),
-            dig_pk<half>(v[4], v[5]), dig_pk<half>(v[6], v[7]));
-        d4[1] = uint4(dig_pk<half>(v[8], v[9]), dig_pk<half>(v[10], v[11]),
-            dig_pk<half>(v[12], v[13]), dig_pk<half>(v[14], v[15]));
+        rate_dec_words<K, H>(W, dst);
     }
+}
+
+// ---- compact prefill stages with the code words staged through threadgroup memory
+// A stage of the compact m128 GEMMs decodes 16 trellis tiles: KT = 4 kt rows of NT = 4 tiles contiguous in the
+// code (8 K words each), rows `row_words` apart. The 256 threads copy them to `words` (tile (kt, nt) at
+// (4 kt + nt) 8 K, so the rows become contiguous) with one coalesced 16-byte load per thread, thread t < 32 K
+// copying uint4 t; the decode then reads its words from threadgroup memory instead of device memory. Needs
+// `stage` and `row_words` 16-byte aligned: tiles are 32 K bytes, a projection's code starts 16-byte aligned in
+// every record layout (records on 4096-byte boundaries, f16 vectors of 2304 / 5120 elements between projections).
+template <int K>
+METAL_FUNC void rate_stage_copy(const device uint* stage, uint row_words, uint tid, threadgroup uint* words) {
+    constexpr uint row4 = 8u * K;  // uint4s per kt row: 4 tiles x 8 K words
+    if (tid < 4u * row4) {
+        const uint kt = tid / row4;
+        const device uint4* src = reinterpret_cast<const device uint4*>(stage + kt * row_words) + (tid - kt * row4);
+        reinterpret_cast<threadgroup uint4*>(words)[tid] = *src;
+    }
+}
+
+// rate_dec_job on a tile staged in threadgroup memory: the same words, the same arithmetic.
+template <int K, int H>
+METAL_FUNC void rate_dec_job_staged(threadgroup const uint* tile, uint c7, threadgroup half* dst) {
+    if constexpr (K == 3) {
+        uint P[4];
+        STEEL_PRAGMA_UNROLL
+        for (uint t = 0; t < 4u; ++t) {
+            P[t] = tile[(3u * c7 + 23u + t) % 24u];
+        }
+        dig_dec_words<half, H>(P, dst);
+    } else {
+        constexpr uint first = (16u + uint(4 * H + 1) * K) / 32u;
+        const uint base = c7 * uint(K);
+        uint W[K + 1];
+        if constexpr (first == 0u) W[0] = tile[c7 != 0u ? base - 1u : 8u * K - 1u];
+        STEEL_PRAGMA_UNROLL
+        for (uint i = 1; i <= uint(K); ++i) {
+            W[i] = tile[base + i - 1u];
+        }
+        rate_dec_words<K, H>(W, dst);
+    }
+}
+
+// One stage's decode for the whole threadgroup: stage the words, barrier, decode this thread's job (tile t of the
+// stage, column half h, column c7) into `dst`. The caller's barrier before the next stage's copy keeps `words`
+// (and `dst`) from being overwritten while they are still read.
+template <int K>
+METAL_FUNC void rate_stage_jobs(const device uint* stage, uint row_words, uint tid, uint h, uint c7, uint t,
+                                threadgroup uint* words, threadgroup half* dst) {
+    rate_stage_copy<K>(stage, row_words, tid, words);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup const uint* tile = words + t * 8u * uint(K);
+    if (h != 0u) rate_dec_job_staged<K, 1>(tile, c7, dst);
+    else rate_dec_job_staged<K, 0>(tile, c7, dst);
 }

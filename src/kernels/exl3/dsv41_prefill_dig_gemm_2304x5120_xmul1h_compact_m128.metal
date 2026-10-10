@@ -19,8 +19,11 @@
     constexpr int N16 = ND / 16;
     constexpr int NTILES = ND / BN;
     constexpr int S = KD / BK;
+    constexpr int KMAX = 5;
     threadgroup uint4 dig_smem[BN * LDB * 2 / 16];
+    threadgroup uint4 stage_smem[KT * NT * 8 * KMAX / 4];  // one stage's 16 tiles at the top rate: 2560 bytes
     threadgroup half* Bs = reinterpret_cast<threadgroup half*>(dig_smem);
+    threadgroup uint* stage_words = reinterpret_cast<threadgroup uint*>(stage_smem);
 
     const uint tid = thread_index_in_threadgroup;
     const uint sg = simdgroup_index_in_threadgroup;
@@ -50,20 +53,16 @@
     const ulong offset = desc[di];
     const int K = int(desc[di + 1ul]);
     const int WPT = 8 * K;
-    // loader (the probe's map): job jj = trellis tile t (kt, nt) of the stage, column half h = sg & 1 (uniform per
-    // simdgroup), column c7 = lane & 7 -> B^T row 16 nt + 8 h + c7, K slots 16 kt .. 16 kt + 15
+    // loader (the probe's map): job = trellis tile t (kt, nt) of the stage, column half h = sg & 1 (uniform per
+    // simdgroup), column c7 = lane & 7 -> B^T row 16 nt + 8 h + c7, K slots 16 kt .. 16 kt + 15. The stage's
+    // words are staged in threadgroup memory first (rate_stage_jobs), once per stage.
+    static_assert(JOBS == 1, "rate_stage_jobs: one job per thread");
     const uint h = sg & 1u;
     const uint c7 = lane & 7u;
-    int dst_off[JOBS];
-    int src_off[JOBS];
-    STEEL_PRAGMA_UNROLL
-    for (int jj = 0; jj < JOBS; ++jj) {
-        const int t = int(lane >> 3u) + 4 * (int(sg >> 1u) + (NSG / 2) * jj);
-        const int kt = t / NT;
-        const int nt = t % NT;
-        dst_off[jj] = (nt * 16 + 8 * int(h) + int(c7)) * LDB + kt * 16;
-        src_off[jj] = (kt * N16 + nt) * WPT;
-    }
+    const uint t = (lane >> 3u) + 4u * (sg >> 1u);
+    const int kt = int(t) / NT;
+    const int nt = int(t) % NT;
+    const int dst_off = (nt * 16 + 8 * int(h) + int(c7)) * LDB + kt * 16;
     const device uint* cd = reinterpret_cast<const device uint*>(code + offset) + size_t(n0 / 16) * size_t(WPT);
     const device half* xa = x + (size_t(row0) + size_t(m0 + tm)) * size_t(KD);
     const bool full = sgp_sm == SM;
@@ -71,26 +70,12 @@
     Dtile.clear();
     for (int s = 0; s < S; ++s) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        STEEL_PRAGMA_UNROLL
-        for (int jj = 0; jj < JOBS; ++jj) {
-            const device uint* tile = cd + size_t(s) * size_t(KT * N16 * WPT) + src_off[jj];
-            if (K == 2) {
-                if (h != 0u) rate_dec_job<2, 1>(tile, c7, Bs + dst_off[jj]);
-                else rate_dec_job<2, 0>(tile, c7, Bs + dst_off[jj]);
-            }
-            else if (K == 3) {
-                if (h != 0u) rate_dec_job<3, 1>(tile, c7, Bs + dst_off[jj]);
-                else rate_dec_job<3, 0>(tile, c7, Bs + dst_off[jj]);
-            }
-            else if (K == 4) {
-                if (h != 0u) rate_dec_job<4, 1>(tile, c7, Bs + dst_off[jj]);
-                else rate_dec_job<4, 0>(tile, c7, Bs + dst_off[jj]);
-            }
-            else {
-                if (h != 0u) rate_dec_job<5, 1>(tile, c7, Bs + dst_off[jj]);
-                else rate_dec_job<5, 0>(tile, c7, Bs + dst_off[jj]);
-            }
-        }
+        const device uint* stage = cd + size_t(s) * size_t(KT * N16 * WPT);
+        const uint row_words = uint(N16 * WPT);
+        if (K == 2) rate_stage_jobs<2>(stage, row_words, tid, h, c7, t, stage_words, Bs + dst_off);
+        else if (K == 3) rate_stage_jobs<3>(stage, row_words, tid, h, c7, t, stage_words, Bs + dst_off);
+        else if (K == 4) rate_stage_jobs<4>(stage, row_words, tid, h, c7, t, stage_words, Bs + dst_off);
+        else rate_stage_jobs<5>(stage, row_words, tid, h, c7, t, stage_words, Bs + dst_off);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sgp_sm > 0) {
             STEEL_PRAGMA_NO_UNROLL

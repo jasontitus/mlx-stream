@@ -34,12 +34,14 @@ effects are real; combining winners is a separate step (below).
 | `opt/prefill-staged-words` | prefill | the stage's 16 tiles are copied to threadgroup memory with coalesced `uint4` loads (one per thread), decoded from there; +2.5 KB threadgroup memory, one more barrier per stage. Its author expects it to lose or tie (the scalar device loads already hit L1; K2/K4 decode reads are 2-/4-way bank-conflicted), built so the benchmark decides. | no | pushed; CPU harness bit-identical (256-thread stage emulation, K2-K5, ASan/UBSan clean) |
 | `opt/decode-hoist` | decode | K dispatch hoisted out of the tk loop only; K2/K4/K5 windows still read one at a time. Isolates the dispatch / register effect. | no | pushed; CPU harness bit-identical (20 kernel cases, 1.07M outputs) |
 | `opt/decode-wordcache` | decode | the hoist plus a per-lane word cache: K2/K4/K5 lanes load 2 words per tile (3 for K5) and funnel-shift them, like the K3 path. Also covers the fixed-rate `_rate_` decode kernels. | no | pushed; same harness, bit-identical |
-| `opt/decode-per-k` | decode | one compile-time-K launch per rate present; other threadgroups exit early | yes | agent running |
+| `opt/decode-per-k` | decode | four `compactk` kernels (template K = 2/3/4/5), launched as a chain: each covers every row, computes rows at its K and copies the previous launch's output for the rest (+3 launches, +3 output reads/writes per stage, about 3 % of the code bytes). Enable with `DSV41_CELL_ROUTED_FORMS=per_k` (combinable with `down_pair,gu_one`; a no-op on fixed-K3 storage). | yes | pushed; CPU harness: 4-launch chain bit-identical to the compact launch (stock + banked, both shapes, rows 1/5/8, sentinel rows); Zig semantic analysis passes cross-target (`zig test --test-no-exec -target aarch64-macos`); new Trace test not executed (needs macOS link) |
 | `opt/decode-staged-x` | decode | 4 simdgroups per threadgroup share the activation row staged in threadgroup memory (20 KB for the 2304-out kernel, 9 KB for 5120-out); K hoisted. Removes the 8 scattered activation loads per lane per tile; costs a serialized staging prologue and, at 20 KB, only one 2304-out group per core if the budget is 32 KB. | no (manifest `threadgroup` 32 -> 128) | pushed; CPU harness bit-identical (all four kernels, 5 seeds, rows 1-9, sentinel rows) |
 | `opt/decode-staged-x8` | decode | the same at 8 simdgroups per threadgroup (`threadgroup` 256): twice the resident simdgroups per KB of staged memory. Its author's pick for the 2304-out kernel. | no | pushed; same harness passes at NSG 8 |
 
-The two `per-k` branches add kernels and a construction-time switch; their report (in the branch's commit
-message and the agent summary pasted into the PR or here) names the switch. Everything else is a drop-in text
+The two `per-k` branches add kernels and a construction-time switch (`DSV41_CELL_ROUTED_FORMS=per_k` for decode; the
+prefill one names its own in its commit message). `opt/decode-per-k` also extends `scripts/bench_exl3_compact.py`: with
+that branch checked out, the bench adds a `<tree> per_k` row that times the 4-launch chain, so the per-K decode idea
+can be judged in tier 3 after all; run the bench from that branch's script. Everything else is a drop-in text
 change behind the same kernel names and manifest `grid` / `threadgroup` rules.
 
 ## Prerequisites

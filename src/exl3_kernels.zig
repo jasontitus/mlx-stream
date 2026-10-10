@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "3e879c0b1705dd63aaafc1d76fa453c3df027c3453aee1c1632c1dbb68999413";
+pub const manifest_sha256 = "cf35a6186bb07d6ab10460a3cffe11978bbd04bd011e8dc05d15f6f889018456";
 
 /// G7: the package's decode-timers build observes each launch of a bound set (its first dispatches per phase, the
 /// observer `Bound.observe` installs); every other build has no observer field, launch key or call.
@@ -195,6 +195,28 @@ pub const Kernel = enum {
     dsv41_exl3_b3_moeprep_dpost_compact,
     dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compact_m128,
     dsv41_prefill_dig_gemm_2304x5120_xmul1h_compact_m128,
+    // The compact prefill GEMMs at a compile-time rate (10-10, mlx-serve native): the compact texts with the descriptor's
+    // 4-way rate dispatch replaced by the template (gate|up: K0 for gate, K1 for up); a threadgroup whose expert's
+    // descriptor carries another rate leaves at once. The per-K route (`DigXPrefill.installPerK`) forms each wave
+    // from experts of one rate class and launches that class's variant (`compactk_kernels`, `compactRatesOf`).
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k2_k3,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k2_k5,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k3_k2,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k3,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k3_k5,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k5_k2,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k5_k3,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k5,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k4,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k2_k4,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k4_k2,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k3_k4,
+    dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k4_k3,
+    dsv41_prefill_dig_gemm_2304x5120_xmul1h_compactk_m128,
+    dsv41_prefill_dig_gemm_2304x5120_xmul1h_compactk_m128__k3,
+    dsv41_prefill_dig_gemm_2304x5120_xmul1h_compactk_m128__k4,
+    dsv41_prefill_dig_gemm_2304x5120_xmul1h_compactk_m128__k5,
 };
 
 /// The text a tag runs: its own, or a variant's base (the part before "__").
@@ -214,7 +236,9 @@ pub fn rateOf(k: Kernel) u32 {
     return ratesOf(k)[0];
 }
 
-/// Gate/up logical rates, or the single projection's rate repeated.
+/// Gate/up logical rates, or the single projection's rate repeated. Zero for the compact texts: the descriptor-driven
+/// ones read each expert's rate from its descriptor, and the per-K ones (`compactRatesOf`) are launched over one rate
+/// class only, so neither takes the rate kernels' code-array inputs.
 pub fn ratesOf(k: Kernel) [2]u32 {
     switch (k) {
         .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_rate_m128__k2_k3 => return .{ 2, 3 },
@@ -271,6 +295,59 @@ pub const compact_kernels = [_]Kernel{
     .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compact_m128,
     .dsv41_prefill_dig_gemm_2304x5120_xmul1h_compact_m128,
 };
+
+/// The per-K compact prefill GEMMs (`compactRatesOf`): the gate|up pairs over K 2 / 3 / 5 (Spark's per-expert
+/// classes) and the K4 mixes the rate kernels carry, the down text at K 2..5. Compiled by `Accepted.routePerK` for
+/// the classes a bank holds, never by the stock accept.
+pub const compactk_kernels = [_]Kernel{
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k2_k3,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k2_k5,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k3_k2,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k3,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k3_k5,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k5_k2,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k5_k3,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k5,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k4,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k2_k4,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k4_k2,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k3_k4,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k4_k3,
+    .dsv41_prefill_dig_gemm_2304x5120_xmul1h_compactk_m128,
+    .dsv41_prefill_dig_gemm_2304x5120_xmul1h_compactk_m128__k3,
+    .dsv41_prefill_dig_gemm_2304x5120_xmul1h_compactk_m128__k4,
+    .dsv41_prefill_dig_gemm_2304x5120_xmul1h_compactk_m128__k5,
+};
+
+/// A per-K compact prefill GEMM's template rates: gate|up (K0, K1), the down text's rate repeated; {0, 0} for every
+/// other kernel (`ratesOf` stays zero for these: they take the compact texts' inputs).
+pub fn compactRatesOf(k: Kernel) [2]u32 {
+    const name = @tagName(k);
+    if (std.mem.indexOf(u8, name, "_compactk_") == null) return .{ 0, 0 };
+    const suffix = if (std.mem.indexOf(u8, name, "__")) |i| name[i + 2 ..] else "";
+    if (suffix.len == 0) return .{ 2, 2 };
+    // "k<a>" or "k<a>_k<b>"
+    const a: u32 = suffix[1] - '0';
+    const b: u32 = if (suffix.len > 2) suffix[4] - '0' else a;
+    return .{ a, b };
+}
+
+test "exl3 kernels: compactRatesOf names each per-K compact prefill GEMM's template" {
+    try std.testing.expectEqual([2]u32{ 2, 2 }, compactRatesOf(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128));
+    try std.testing.expectEqual([2]u32{ 2, 5 }, compactRatesOf(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k2_k5));
+    try std.testing.expectEqual([2]u32{ 5, 3 }, compactRatesOf(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k5_k3));
+    try std.testing.expectEqual([2]u32{ 3, 3 }, compactRatesOf(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compactk_m128__k3));
+    try std.testing.expectEqual([2]u32{ 2, 2 }, compactRatesOf(.dsv41_prefill_dig_gemm_2304x5120_xmul1h_compactk_m128));
+    try std.testing.expectEqual([2]u32{ 5, 5 }, compactRatesOf(.dsv41_prefill_dig_gemm_2304x5120_xmul1h_compactk_m128__k5));
+    try std.testing.expectEqual([2]u32{ 0, 0 }, compactRatesOf(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compact_m128));
+    try std.testing.expectEqual([2]u32{ 0, 0 }, compactRatesOf(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_rate_m128__k3_k4));
+    for (compactk_kernels) |k| {
+        const r = compactRatesOf(k);
+        try std.testing.expect(r[0] >= 2 and r[0] <= 5 and r[1] >= 2 and r[1] <= 5);
+        try std.testing.expect(ratesOf(k)[0] == 0);
+    }
+}
 
 /// Header texts shared by several kernels (file header_<tag>.metal).
 pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail, woa_e4m3, index_topk, attnfuse, mxfp8_m1rows, attnfuse_s2, attnhalf_idx, pf_hc, smallk, joinless, dig_mul1h_k3_lut, hcpost_tf32, mul1h_rate };

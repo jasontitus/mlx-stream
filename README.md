@@ -181,6 +181,7 @@ served behavior.
 | `DSV41_CELL_PHASE_SETTLE` | cell | `until_freed` | `interval`: the phase change's settle waits for the freed bytes only, not the grow's bound. |
 | `DSV41_CELL_PHASE_POLL_MS` | cell | the settle's own | the phase change's footprint poll in ms (1 .. the settle bound; outside is refused). |
 | `DSV41_CELL_PREFILL_SUB` | cell | the cache's sub-chunk | the prompt rows per layer-major call; `whole` runs the prompt in one call. |
+| `DSV41_CELL_PREFILL_PERK` | cell | `0` | `1`: a compact bank's prefill waves hold one rate class each and run that class's compile-time-K GEMM texts (exact: every row written once by its own wave; refused by name on a fixed-rate bank). |
 | `DSV41_CELL_MAX_CONTEXT` | cell (bill tool) | 16,384 | the longest prompt the construction bills; the server takes it from `ctx_size`. |
 
 The test suites also read their own inputs (`DSV41_BANK`, device-only smoke switches, fixture paths and cell

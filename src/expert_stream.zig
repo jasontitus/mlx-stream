@@ -196,6 +196,14 @@ pub const StreamSource = struct {
         return self.stream.phase == .decode;
     }
 
+    /// A compact bank's record rates (gate, up, down K) of layer `layer`'s expert `expert` (the per-K prefill route's
+    /// `PrefillRows.rates`); null for a fixed-rate bank, whose kernels take the layer's rates.
+    pub fn recordRates(self: *const StreamSource, layer: u32, expert: u32) ?[3]u8 {
+        if (!self.stream.bank.isCompact()) return null;
+        const k = self.stream.bank.recordGeometry(layer, expert).projection_k;
+        return .{ @intCast(k[0]), @intCast(k[1]), @intCast(k[2]) };
+    }
+
     pub fn waitGu(self: *StreamSource, call: *Call, part: u32) Error!void {
         return self.stream.waitGu(call.route.?, part);
     }

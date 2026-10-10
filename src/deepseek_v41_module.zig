@@ -115,6 +115,9 @@ pub const RouteOverrides = struct {
     engram_posted: ?bool = null,
     /// The DIG-X prefill waves' fused down GEMM (the down GEMM and rot_widen1 in one launch; null / false: stock).
     prefill_fused_down: ?bool = null,
+    /// The DIG-X prefill waves' per-K compact GEMMs (rate-homogeneous waves on each class's own text; a compact bank
+    /// only; null / false: the descriptor-driven texts).
+    prefill_per_k: ?bool = null,
     /// The verify-row routes (C23 softmax, C27 select, C28 smallm, C29 mxfp8 rows).
     decode_attn_softmax: ?bool = null,
     decode_index_topk: ?bool = null,
@@ -649,6 +652,12 @@ pub const Module = struct {
             var kd: xk.Diag = .{};
             self.exl3.routeFusedDown(self.set, &kd) catch |e| return refused(refuse(&diag, e, "exl3 fused down: {s}", .{kd.message()}), &diag);
         }
+        // The per-K compact prefill GEMMs, when overridden: the bank's classes' variants compiled on the set, then every
+        // layer's DIG-X waves form rate-homogeneous waves on them (refused by name on a fixed-rate bank).
+        if (ov.prefill_per_k orelse false) {
+            var kd: xk.Diag = .{};
+            self.exl3.routePerK(self.set, &kd) catch |e| return refused(refuse(&diag, e, "exl3 per-K prefill: {s}", .{kd.message()}), &diag);
+        }
         // kv16-opt: the DIG-X waves' expert outputs in bf16 (the cold-row GEMVs write f32: refused together).
         if (config.dsv41ExpertBf16()) {
             if ((config.expert_wide_cold_rows orelse 0) > 0) return refused(refuse(&diag, error.ExpertBf16WithColdRows, "kv16 expert bf16: the wide call's cold rows write f32 outputs", .{}), &diag);
@@ -796,7 +805,7 @@ pub const Module = struct {
             self.model.engram.?.posted = true;
         }
         self.installed = switch (self.arm) {
-            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .transient_release = t.arm.stream.release_installed, .grow_fill = t.arm.stream.grow_fill, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .hoist_first = t.arm.hook.hoistFirst(), .devroute = t.arm.hook.devRoute() },
+            inline else => |t| .{ .prefill_unjoined = self.model.tier.routes.prefill_joinless and comptime (@hasDecl(@TypeOf(t.arm.hook).Math, "has_parts") and @TypeOf(t.arm.hook).Math.has_parts), .layer_major = self.model.tier.layer_major, .wide = t.arm.hook.wide_route, .stream_windows = t.arm.stream.wide_depth, .prefill_attn = self.model.tier.routes.prefill_attn, .prefill_index = self.model.tier.routes.prefill_index, .prefill_hc = self.model.tier.routes.prefill_hc, .prefill_combine = self.model.tier.routes.prefill_combine, .prefill_oproj = self.model.tier.routes.prefill_oproj, .prefill_host_shared = self.model.tier.routes.prefill_host_shared, .prefill_joinless = self.model.tier.routes.prefill_joinless, .prefill_hc_post = self.model.tier.routes.prefill_hc_post, .engram_posted = if (self.model.engram) |en| en.posted else false, .prefill_fused_down = self.exl3.fused_down, .prefill_per_k = self.exl3.per_k, .transient_release = t.arm.stream.release_installed, .grow_fill = t.arm.stream.grow_fill, .lookahead_budget = if (t.arm.stream.selector) |sel| sel.budget else 0, .hoist_first = t.arm.hook.hoistFirst(), .devroute = t.arm.hook.devRoute() },
         };
         // DEVROUTE: exact by construction (the same banked texts per routed pair, the slots the host's plan names; the join
         // takes the miss parts' rows for their pairs).
@@ -1839,6 +1848,8 @@ pub const Installed = struct {
     prefill_unjoined: bool = false,
     /// The DIG-X waves launch the fused down GEMM (installed, past its self-checks).
     prefill_fused_down: bool = false,
+    /// The DIG-X waves launch the per-K compact GEMMs over rate-homogeneous waves (installed, past their compiles).
+    prefill_per_k: bool = false,
     /// The phase change's transient release (installed in the stream at construction).
     transient_release: bool = false,
     /// The decode read-ahead's speculative records per layer call (the stream's selector; 0 = none).
@@ -1913,7 +1924,7 @@ pub const Installed = struct {
     }
 
     pub fn callSites(self: Installed, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}, embedding rows {}, unjoined waves {}, engram posted {}, deferred base calls {}, hc post {}, fused down {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless, self.embedding_rows, self.prefill_unjoined, self.engram_posted, self.wide.defer_base, self.prefill_hc_post, self.prefill_fused_down }) catch buf[0..0];
+        return std.fmt.bufPrint(buf, "NATIVE prefill call sites installed: attention core {}, indexer {}, hc norms {}, combine {}, o-projection {}, host shared {}, joinless {}, embedding rows {}, unjoined waves {}, engram posted {}, deferred base calls {}, hc post {}, fused down {}, per-K {}", .{ self.prefill_attn, self.prefill_index, self.prefill_hc, self.prefill_combine, self.prefill_oproj, self.prefill_host_shared, self.prefill_joinless, self.embedding_rows, self.prefill_unjoined, self.engram_posted, self.wide.defer_base, self.prefill_hc_post, self.prefill_fused_down, self.prefill_per_k }) catch buf[0..0];
     }
 
     /// The construction log line the gates assert.

@@ -79,7 +79,7 @@ pub const kernels = [_]Kernel{
     .dsv41_exl3_b3_moeprep_dpost,
     .dsv41_exl3_b3_pair_k3_5120,
     .dsv41_exl3_b3_guone_k3_2304,
-} ++ xk.rate_kernels ++ xk.compact_kernels;
+} ++ xk.rate_kernels ++ xk.compact_kernels ++ xk.compactk_kernels;
 
 /// The routed decode forms (`DSV41_CELL_ROUTED_FORMS`): each independently selectable, chosen at construction.
 pub const Forms = struct { down_pair: bool = false, gu_one: bool = false };
@@ -284,6 +284,8 @@ pub fn Accepted(comptime G: type) type {
         waves: []DigXPrefill(G) = &.{},
         /// the waves' down stage is the fused down GEMM (`routeFusedDown`)
         fused_down: bool = false,
+        /// the waves launch the per-K compact prefill GEMMs over rate-homogeneous waves (`routePerK`)
+        per_k: bool = false,
         /// kv16-opt: the waves' expert outputs in bf16 (`routeExpertBf16`)
         expert_bf16: bool = false,
         /// the decode GEMVs' routed forms (`routeForms`); all false: the stock mul1h texts
@@ -384,6 +386,34 @@ pub fn Accepted(comptime G: type) type {
             self.fused_down = true;
         }
 
+        /// The per-K compact prefill GEMMs, at construction (before any prefill; a compact bank only): the variants of
+        /// every rate class the bank holds compiled on `set` (their checks join the report), then every layer's waves
+        /// form rate-homogeneous waves and launch each class's variant (`DigXPrefill.installPerK`). A class whose
+        /// rates no variant carries is refused by name (PerKRateUnsupported) before anything is installed.
+        pub fn routePerK(self: *Self, set: *const ks.Set, diag: *Diag) !void {
+            if (!self.compact) {
+                diag.set("exl3 per-K prefill: the bank's rates are fixed (its GEMMs already run at one rate)", .{});
+                return error.PerKNeedsCompact;
+            }
+            var seen: std.EnumSet(Kernel) = .empty;
+            for (self.layer_rates, 0..) |rates, li| for (rates.compact) |triple| {
+                const gu = compactkGuTag(triple[0], triple[1]) orelse {
+                    diag.set("exl3 per-K prefill: layer {d} holds a gate K{d} / up K{d} class no variant carries", .{ li, triple[0], triple[1] });
+                    return error.PerKRateUnsupported;
+                };
+                const dn = compactkDnTag(triple[2]) orelse {
+                    diag.set("exl3 per-K prefill: layer {d} holds a down K{d} class no variant carries", .{ li, triple[2] });
+                    return error.PerKRateUnsupported;
+                };
+                seen.insert(gu);
+                seen.insert(dn);
+            };
+            var it = seen.iterator();
+            while (it.next()) |k| try set.selfCheck(self.a, &.{k}, .compile, &self.report, diag);
+            for (self.waves) |*w| w.installPerK();
+            self.per_k = true;
+        }
+
         /// The decode route texts (the forms', the banked route's) compiled at construction with the rest of the set
         /// (`.compile`: compile, bind, one launch), so no route text compiles at its first decode launch.
         pub fn compileTexts(self: *Self, set: *const ks.Set, texts: []const Kernel, diag: *Diag) !void {
@@ -465,9 +495,9 @@ pub const banked_texts = [_]Kernel{
 };
 pub const checked_at_accept = blk: {
     @setEvalBranchQuota(4000);
-    var out: [kernels.len - w1_texts.len - lut_texts.len - form_texts.len - banked_texts.len - xk.rate_kernels.len - xk.compact_kernels.len]Kernel = undefined;
+    var out: [kernels.len - w1_texts.len - lut_texts.len - form_texts.len - banked_texts.len - xk.rate_kernels.len - xk.compact_kernels.len - xk.compactk_kernels.len]Kernel = undefined;
     var n: usize = 0;
-    for (kernels) |k| if (std.mem.indexOfScalar(Kernel, &(w1_texts ++ lut_texts ++ form_texts ++ banked_texts ++ xk.rate_kernels ++ xk.compact_kernels), k) == null) {
+    for (kernels) |k| if (std.mem.indexOfScalar(Kernel, &(w1_texts ++ lut_texts ++ form_texts ++ banked_texts ++ xk.rate_kernels ++ xk.compact_kernels ++ xk.compactk_kernels), k) == null) {
         out[n] = k;
         n += 1;
     };
@@ -1036,6 +1066,11 @@ pub fn Rebuild(comptime G: type) type {
 pub const WaveExpert = struct { slot: u32, rows: u32 };
 pub const DigTable = struct { table: [80]i32, tgs: u32 };
 
+/// A record's rates as one wave-class key (gate K << 16 | up K << 8 | down K): nonzero for every rate triple.
+pub fn rateKey(rates: [3]u8) u32 {
+    return (@as(u32, rates[0]) << 16) | (@as(u32, rates[1]) << 8) | rates[2];
+}
+
 /// q3_prefill_dig_candidate.wave_table: per expert (<= 16, rows grouped by expert in order)
 /// slot, first row, rows, first threadgroup (unused: INT32_MAX); [64] experts, [65] threadgroups.
 /// `tiles` = the GEMM's threadgroups per 64-row tile (`digTiles`).
@@ -1064,6 +1099,40 @@ pub fn digTableBm(experts: []const WaveExpert, tiles: u32, bm: u32) DigTable {
     t[64] = @intCast(experts.len);
     t[65] = @intCast(tg);
     return .{ .table = t, .tgs = @intCast(tg) };
+}
+
+/// The per-K compact gate|up GEMM at gate rate `k0` and up rate `k1` (`xk.compactk_kernels`); null for a pair no
+/// variant carries.
+pub fn compactkGuTag(k0: u32, k1: u32) ?Kernel {
+    for (xk.compactk_kernels) |k| {
+        if (std.mem.indexOf(u8, @tagName(k), "_gu_") == null) continue;
+        const r = xk.compactRatesOf(k);
+        if (r[0] == k0 and r[1] == k1) return k;
+    }
+    return null;
+}
+
+/// The per-K compact down GEMM at rate `k`; null for a rate no variant carries.
+pub fn compactkDnTag(k: u32) ?Kernel {
+    for (xk.compactk_kernels) |kk| {
+        if (std.mem.indexOf(u8, @tagName(kk), "_gu_") != null) continue;
+        if (xk.compactRatesOf(kk)[0] == k) return kk;
+    }
+    return null;
+}
+
+test "exl3 per-K prefill: every compact class rate maps to its own variant" {
+    const t = std.testing;
+    for ([_]u32{ 2, 3, 4, 5 }) |a| {
+        try t.expectEqual(a, xk.compactRatesOf(compactkDnTag(a).?)[0]);
+        for ([_]u32{ 2, 3, 4, 5 }) |b| {
+            if (compactkGuTag(a, b)) |k| {
+                try t.expectEqual([2]u32{ a, b }, xk.compactRatesOf(k));
+            } else try t.expect((a == 4 or b == 4) and a + b == 9); // only the K4 / K5 mixes are not carried
+        }
+    }
+    try t.expectEqual(@as(?Kernel, null), compactkGuTag(1, 2));
+    try t.expectEqual(@as(?Kernel, null), compactkDnTag(6));
 }
 
 /// DIG-X on DIG2 onepass: the NAX GEMMs whose B loader decodes the trellis, the rotation
@@ -1097,9 +1166,20 @@ pub fn DigX(comptime G: type) type {
         rate_dn: [3]*const Entry,
         compact_gu: *const Entry,
         compact_dn: *const Entry,
+        /// the per-K compact texts by (gate K - 2, up K - 2) / (down K - 2); null: no variant (`compactkGuTag`)
+        compactk_gu: [4][4]?*const Entry,
+        compactk_dn: [4]?*const Entry,
 
         pub fn init(reg: *const xk.Registry) Self {
+            var ck_gu: [4][4]?*const Entry = @splat(@splat(null));
+            var ck_dn: [4]?*const Entry = @splat(null);
+            for (0..4) |i| {
+                ck_dn[i] = if (compactkDnTag(@intCast(i + 2))) |k| reg.get(k) else null;
+                for (0..4) |j| ck_gu[i][j] = if (compactkGuTag(@intCast(i + 2), @intCast(j + 2))) |k| reg.get(k) else null;
+            }
             return .{
+                .compactk_gu = ck_gu,
+                .compactk_dn = ck_dn,
                 .compact_gu = reg.get(.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compact_m128),
                 .compact_dn = reg.get(.dsv41_prefill_dig_gemm_2304x5120_xmul1h_compact_m128),
                 .gemm_gu = reg.get(.q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3),
@@ -1135,8 +1215,18 @@ pub fn DigX(comptime G: type) type {
         /// x0 / x1 [rows, 1, 5120] f16 (take2), gate / up code, the gate|up table at `m_tile` rows -> (zg, zu)
         /// [rows, 2304] f32: the 128-row text, the 64-row text's words.
         pub fn gemmGateUp(self: *const Self, g: *G, x0: G.T, x1: G.T, code_g: G.T, code_u: G.T, tbl: G.T, tgs: u32, lg: ProjectionStorage(G.T), lu: ProjectionStorage(G.T)) ![2]G.T {
+            return self.gemmGateUpAt(g, x0, x1, code_g, code_u, tbl, tgs, lg, lu, null);
+        }
+
+        /// `gemmGateUp` over a wave whose experts all hold gate rate `rates[0]` and up rate `rates[1]` (compact
+        /// storage; the per-K route): that pair's compact text, the same inputs and words. A pair no variant carries
+        /// is refused (PerKRateUnsupported; `Accepted.routePerK` checks the bank's classes first). Null rates, or
+        /// fixed storage: the stock choice.
+        pub fn gemmGateUpAt(self: *const Self, g: *G, x0: G.T, x1: G.T, code_g: G.T, code_u: G.T, tbl: G.T, tgs: u32, lg: ProjectionStorage(G.T), lu: ProjectionStorage(G.T), rates: ?[2]u32) ![2]G.T {
             if ((lg == .compact) != (lu == .compact)) return error.StorageNotPrepared;
-            const entry = if (lg == .compact) self.compact_gu else if (lg.tightK3() and lu.tightK3()) self.gemm_gu128 else self.rate_gu[lg.fixed.k - 2][lu.fixed.k - 2];
+            const entry = if (lg == .compact)
+                (if (rates) |r| (self.compactkGu(r[0], r[1]) orelse return error.PerKRateUnsupported) else self.compact_gu)
+            else if (lg.tightK3() and lu.tightK3()) self.gemm_gu128 else self.rate_gu[lg.fixed.k - 2][lu.fixed.k - 2];
             var vars = rowsVars(rowsOf(G, g, x0, 0));
             vars.set(.tgs, tgs);
             var out: [2]G.T = undefined;
@@ -1174,7 +1264,27 @@ pub fn DigX(comptime G: type) type {
         /// x [rows, 1, 2304] f16 (onepass), down code, the down table at `m_tile` rows -> z [rows, 5120] f32: the
         /// 128-row text, the 64-row text's words.
         pub fn gemmDown(self: *const Self, g: *G, x: G.T, code_d: G.T, tbl: G.T, tgs: u32, layout: ProjectionStorage(G.T)) !G.T {
-            const entry = if (layout == .compact) self.compact_dn else if (layout.tightK3()) self.gemm_dn128 else self.rate_dn[layout.fixed.k - 2];
+            return self.gemmDownAt(g, x, code_d, tbl, tgs, layout, null);
+        }
+
+        /// The per-K compact gate|up text at (gate K, up K); null for a pair no variant carries or a rate outside 2..5.
+        pub fn compactkGu(self: *const Self, k0: u32, k1: u32) ?*const Entry {
+            if (k0 < 2 or k0 > 5 or k1 < 2 or k1 > 5) return null;
+            return self.compactk_gu[k0 - 2][k1 - 2];
+        }
+
+        /// The per-K compact down text at rate `k`; null for a rate no variant carries.
+        pub fn compactkDn(self: *const Self, k: u32) ?*const Entry {
+            if (k < 2 or k > 5) return null;
+            return self.compactk_dn[k - 2];
+        }
+
+        /// `gemmDown` over a wave whose experts all hold down rate `rate` (compact storage; the per-K route): that
+        /// rate's compact text, the same inputs and words (`gemmGateUpAt`).
+        pub fn gemmDownAt(self: *const Self, g: *G, x: G.T, code_d: G.T, tbl: G.T, tgs: u32, layout: ProjectionStorage(G.T), rate: ?u32) !G.T {
+            const entry = if (layout == .compact)
+                (if (rate) |k| (self.compactkDn(k) orelse return error.PerKRateUnsupported) else self.compact_dn)
+            else if (layout.tightK3()) self.gemm_dn128 else self.rate_dn[layout.fixed.k - 2];
             var vars = rowsVars(rowsOf(G, g, x, 0));
             vars.set(.tgs, tgs);
             var out: [1]G.T = undefined;
@@ -1231,8 +1341,13 @@ pub fn DigX(comptime G: type) type {
 
         /// `Dig2GemmOnePassX`: take2 -> the gate|up GEMM -> onepass: (hd, zg, zu).
         pub fn gateUpOnePass(self: *const Self, g: *G, act: G.T, ridx: G.T, rhs: G.T, gu: DigTableArray(G), gate: ProjArrays(G.T), up: ProjArrays(G.T), down_rin: G.T) ![3]G.T {
+            return self.gateUpOnePassAt(g, act, ridx, rhs, gu, gate, up, down_rin, null);
+        }
+
+        /// `gateUpOnePass` with the gate|up GEMM at the wave's (gate K, up K) (`gemmGateUpAt`).
+        pub fn gateUpOnePassAt(self: *const Self, g: *G, act: G.T, ridx: G.T, rhs: G.T, gu: DigTableArray(G), gate: ProjArrays(G.T), up: ProjArrays(G.T), down_rin: G.T, rates: ?[2]u32) ![3]G.T {
             const x = try self.take2(g, act, ridx, rhs, gu.tbl, gate.rin, up.rin);
-            const z = try self.gemmGateUp(g, x[0], x[1], gate.code, up.code, gu.tbl, gu.tgs, gate.layout, up.layout);
+            const z = try self.gemmGateUpAt(g, x[0], x[1], gate.code, up.code, gu.tbl, gu.tgs, gate.layout, up.layout, rates);
             const hd = try self.onePass(g, z[0], z[1], rhs, gu.tbl, gate.rout, up.rout, down_rin);
             return .{ hd, z[0], z[1] };
         }
@@ -1311,7 +1426,8 @@ pub fn DigXPrefill(comptime G: type) type {
         /// The wave's down stage, installed at construction (`installDown`): the 128-row down text then rot_widen1
         /// (stock), or the fused down GEMM (the same words in one launch). Each builds its own table.
         pub const Down = enum { chain, fused };
-        const DownStage = *const fn (self: *const Self, g: *G, hd: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, rhs: G.T) anyerror!G.T;
+        /// `kd`: the wave's down rate under the per-K route (every expert's), null otherwise.
+        const DownStage = *const fn (self: *const Self, g: *G, hd: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, rhs: G.T, kd: ?u32) anyerror!G.T;
         dig: DigX(G),
         shape: PrefillShape,
         tiles_gu: u32,
@@ -1322,6 +1438,12 @@ pub fn DigXPrefill(comptime G: type) type {
         down: DownStage = downChain,
         /// one wave's launches: the take2 retune, the gate|up GEMM, onepass, then the down stage's (2 stock, 1 fused)
         wave_launches: u32 = 5,
+        /// The per-K route (`installPerK`): a call whose rows carry their slots' rates (`PrefillRows.rates`) forms each
+        /// wave from experts of one rate class (the snake order partitioned by class, stable) and launches that class's
+        /// per-K compact GEMMs (`DigX.gemmGateUpAt` / `gemmDownAt`). Every row is still written exactly once, by its own
+        /// wave: no extra traffic, the same launches per wave; a class boundary can only end a wave early. Rows without
+        /// rates run the descriptor-driven texts.
+        per_k: bool = false,
         a: Allocator,
         diag: ?*xk.Diag,
         /// waves in flight, oldest first (kept handles; persist across carried calls)
@@ -1339,6 +1461,8 @@ pub fn DigXPrefill(comptime G: type) type {
         ridx: std.ArrayList(i32) = .empty,
         rhs: std.ArrayList(u32) = .empty,
         inv: std.ArrayList(u32) = .empty,
+        /// per group its rate class key (gate K << 16 | up K << 8 | down K; 0: unknown), the per-K route's wave boundary
+        gkey: std.ArrayList(u32) = .empty,
 
         /// `diag` (optional) receives the refusal messages of `init` and of every call.
         pub fn init(a: Allocator, reg: *const xk.Registry, shape: PrefillShape, diag: ?*xk.Diag) Refusal!Self {
@@ -1354,7 +1478,7 @@ pub fn DigXPrefill(comptime G: type) type {
             for (self.parts.items) |x| g.release(x);
             self.flight.deinit(self.a);
             self.parts.deinit(self.a);
-            inline for (.{ &self.group_of, &self.gslot, &self.gcount, &self.gnext, &self.snake, &self.sorted, &self.grows, &self.pos, &self.ridx, &self.rhs, &self.inv }) |l| l.deinit(self.a);
+            inline for (.{ &self.group_of, &self.gslot, &self.gcount, &self.gnext, &self.snake, &self.sorted, &self.grows, &self.pos, &self.ridx, &self.rhs, &self.inv, &self.gkey }) |l| l.deinit(self.a);
         }
 
         /// The prefill boundary: every wave still in flight evaluated, oldest first.
@@ -1388,6 +1512,9 @@ pub fn DigXPrefill(comptime G: type) type {
             const a = self.a;
             const cnt = self.gcount.items;
             const order = self.snake.items;
+            // the per-K route: a wave holds one rate class (`group` partitioned the snake order by class)
+            const keys = self.gkey.items;
+            const homog = self.per_k and rows.rates != null;
             for (self.parts.items) |x| g.release(x);
             self.parts.clearRetainingCapacity();
             var i: usize = 0;
@@ -1396,7 +1523,7 @@ pub fn DigXPrefill(comptime G: type) type {
                 const first = i;
                 var wave_rows: usize = cnt[order[i]];
                 i += 1;
-                while (i < order.len and i - first < self.shape.wave and wave_rows + cnt[order[i]] <= self.shape.row_budget) : (i += 1) wave_rows += cnt[order[i]];
+                while (i < order.len and i - first < self.shape.wave and wave_rows + cnt[order[i]] <= self.shape.row_budget and (!homog or keys[order[i]] == keys[order[first]])) : (i += 1) wave_rows += cnt[order[i]];
                 const solo = wave_rows > self.shape.row_budget;
                 const keep: usize = if (solo) 0 else self.shape.inflight - 1;
                 prof.charge(.encode, tp);
@@ -1415,7 +1542,7 @@ pub fn DigXPrefill(comptime G: type) type {
                 try self.parts.ensureUnusedCapacity(a, 1);
                 try self.flight.ensureUnusedCapacity(a, 1);
                 const m = g.mark();
-                const y = try self.submit(g, act, bank, ex[0 .. i - first], self.ridx.items[r0..off], self.rhs.items[r0..off]);
+                const y = try self.submit(g, act, bank, ex[0 .. i - first], self.ridx.items[r0..off], self.rhs.items[r0..off], if (homog) keys[order[first]] else 0);
                 self.parts.appendAssumeCapacity(g.keep(y));
                 if (solo) {
                     prof.charge(.encode, tp);
@@ -1477,6 +1604,11 @@ pub fn DigXPrefill(comptime G: type) type {
             self.parts.clearRetainingCapacity();
         }
 
+        /// The per-K route (`per_k`), before any call (`Accepted.routePerK` compiled the bank's variants first).
+        pub fn installPerK(self: *Self) void {
+            self.per_k = true;
+        }
+
         /// The down stage (`Down`), before any call: the stage's function and the wave's launch count.
         pub fn installDown(self: *Self, d: Down) void {
             switch (d) {
@@ -1492,29 +1624,31 @@ pub fn DigXPrefill(comptime G: type) type {
         }
 
         /// One wave's launches (`wave_launches`) -> its rows' output f32 [R, 5120] (the lane's `y.reshape(-1, H)`).
-        fn submit(self: *Self, g: *G, act: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, ridx: []const i32, rhs: []const u32) !G.T {
+        /// `key`: the wave's rate class (`gkey`) under the per-K route, 0 otherwise.
+        fn submit(self: *Self, g: *G, act: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, ridx: []const i32, rhs: []const u32, key: u32) !G.T {
             const n: c_int = @intCast(ridx.len);
             // at the routed GEMMs' M tile; take2 and onepass read the gate|up table's slot column only
             const tg = digTableBm(ex, self.tiles_gu, DigX(G).m_tile);
             const tgu = try g.hostArray(std.mem.sliceAsBytes(&tg.table), &.{80}, .int32);
             const ridx_a = try g.hostArray(std.mem.sliceAsBytes(ridx), &.{n}, .int32);
             const rhs_a = try g.hostArray(std.mem.sliceAsBytes(rhs), &.{n}, .uint32);
-            const hz = try self.dig.gateUpOnePass(g, act, ridx_a, rhs_a, .{ .tbl = tgu, .tgs = tg.tgs }, bank.gate, bank.up, bank.down.rin);
-            const y = try self.down(self, g, hz[0], bank, ex, rhs_a);
+            const gu_rates: ?[2]u32 = if (key != 0) .{ key >> 16, (key >> 8) & 0xff } else null;
+            const hz = try self.dig.gateUpOnePassAt(g, act, ridx_a, rhs_a, .{ .tbl = tgu, .tgs = tg.tgs }, bank.gate, bank.up, bank.down.rin, gu_rates);
+            const y = try self.down(self, g, hz[0], bank, ex, rhs_a, if (key != 0) key & 0xff else null);
             return g.reshape(y, &.{ n, hidden });
         }
 
         /// Stock: the 128-row down text over its 80-tile table, then rot_widen1 (the table's slot column).
-        fn downChain(self: *const Self, g: *G, hd: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, rhs: G.T) anyerror!G.T {
+        fn downChain(self: *const Self, g: *G, hd: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, rhs: G.T, kd: ?u32) anyerror!G.T {
             const td = digTableBm(ex, self.tiles_dn, DigX(G).m_tile);
             const tdn = try g.hostArray(std.mem.sliceAsBytes(&td.table), &.{80}, .int32);
-            const zd = try self.dig.gemmDown(g, hd, bank.down.code, tdn, td.tgs, bank.down.layout);
+            const zd = try self.dig.gemmDownAt(g, hd, bank.down.code, tdn, td.tgs, bank.down.layout, kd);
             return self.dig.widen1(g, zd, rhs, tdn, bank.down.rout);
         }
 
         /// Fused: the fused down GEMM over its 40-tile table (rot_widen1 as its epilogue reads the table's slot column).
-        fn downFused(self: *const Self, g: *G, hd: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, rhs: G.T) anyerror!G.T {
-            if (!bank.down.layout.tightK3()) return self.downChain(g, hd, bank, ex, rhs);
+        fn downFused(self: *const Self, g: *G, hd: G.T, bank: BankArrays(G.T), ex: []const WaveExpert, rhs: G.T, kd: ?u32) anyerror!G.T {
+            if (!bank.down.layout.tightK3()) return self.downChain(g, hd, bank, ex, rhs, kd);
             const tw = digTableBm(ex, self.tiles_w, DigX(G).m_tile);
             const tdw = try g.hostArray(std.mem.sliceAsBytes(&tw.table), &.{80}, .int32);
             return self.dig.gemmDownWiden(g, hd, bank.down.code, bank.down.rout, tdw, tw.tgs);
@@ -1529,6 +1663,8 @@ pub fn DigXPrefill(comptime G: type) type {
             @memset(self.group_of.items, -1);
             self.gslot.clearRetainingCapacity();
             self.gcount.clearRetainingCapacity();
+            self.gkey.clearRetainingCapacity();
+            const homog = self.per_k and rows.rates != null;
             for (rows.slot, 0..) |s, i| {
                 std.debug.assert(!(s >= cap));
                 if (rows.act_row) |ar| std.debug.assert(ar[i] < a_rows);
@@ -1538,7 +1674,10 @@ pub fn DigXPrefill(comptime G: type) type {
                     self.group_of.items[s] = gi;
                     try self.gslot.append(a, s);
                     try self.gcount.append(a, 0);
+                    // a slot's rows all carry its record's rates (the caller's route guarantees it, asserted below)
+                    try self.gkey.append(a, if (homog) rateKey(rows.rates.?[i]) else 0);
                 }
+                if (homog) std.debug.assert(self.gkey.items[@intCast(gi)] == rateKey(rows.rates.?[i]));
                 self.gcount.items[@intCast(gi)] += 1;
             }
             const ng = self.gslot.items.len;
@@ -1577,6 +1716,13 @@ pub fn DigXPrefill(comptime G: type) type {
                     k += 1;
                 }
             }
+            // the per-K route: the snake order partitioned by rate class (stable: each class keeps its snake order), so
+            // `runWaves` ends a wave at a class boundary and launches each class's own texts
+            if (homog) std.mem.sort(u32, self.snake.items, @as([]const u32, self.gkey.items), struct {
+                fn less(keys: []const u32, x: u32, y: u32) bool {
+                    return keys[x] < keys[y];
+                }
+            }.less);
             // rows in wave order: the snake order's groups, each group's rows ascending
             try self.pos.resize(a, n);
             try self.ridx.resize(a, n);
@@ -3993,7 +4139,7 @@ test "dsv41 pre-ship gate: the kernels' full self-check plan on the device, ever
     var failed: usize = 0;
     // Both depths, each timed: the construction runs `.compile`; `.full` is the manifest's whole plan (the numeric probes).
     inline for (.{ selfcheck.Depth.compile, selfcheck.Depth.full }) |depth| {
-        inline for (.{ .{ "exl3_quant_accept", &checked_at_accept }, .{ "exl3_integer_rates", &xk.rate_kernels }, .{ "exl3_compact", &xk.compact_kernels }, .{ "trunk_routes", &trunk.kernels } }) |plan| {
+        inline for (.{ .{ "exl3_quant_accept", &checked_at_accept }, .{ "exl3_integer_rates", &xk.rate_kernels }, .{ "exl3_compact", &xk.compact_kernels }, .{ "exl3_compact_per_k", &xk.compactk_kernels }, .{ "trunk_routes", &trunk.kernels } }) |plan| {
             var report: selfcheck.Report = .{};
             defer report.deinit(a);
             const t0 = std.Io.Timestamp.now(testing.io, .awake);

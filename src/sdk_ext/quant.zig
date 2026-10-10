@@ -81,7 +81,9 @@ pub const Context = struct {
 
 /// One prefill call's routed rows: `slot[i]` is routed row i's bank slot; row i reads x row i,
 /// or x row `act_row[i]` when given (the chunk's tokens: routed row / top_k).
-pub const PrefillRows = struct { slot: []const u32, act_row: ?[]const u32 = null };
+/// `rates[i]`: assignment row i's slot record rates (gate, up, down K) in a compact bank, when the source knows them
+/// (the per-K prefill route forms its waves by them); null: unknown, every route runs the descriptor-driven texts.
+pub const PrefillRows = struct { slot: []const u32, act_row: ?[]const u32 = null, rates: ?[]const [3]u8 = null };
 
 /// A layer bank's three projections, each one `Q.Arrays(T)`.
 pub fn BankArrays(comptime A: type) type {

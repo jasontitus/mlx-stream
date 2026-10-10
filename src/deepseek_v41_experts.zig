@@ -863,6 +863,11 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
         /// the device wave and every miss pair from its part. Needs the banked route.
         pub const Options = struct { gates: []const Gate = &.{}, event: ?expert_event.Event = null, wide: Wide = .{}, banked: bool = false, hoist_first: bool = false, devroute: bool = false };
 
+        /// A call's rates list when every one of its `n` rows carries one (a compact bank), else null (the stock texts).
+        fn ratesOrNull(rates: []const [3]u8, n: usize) ?[]const [3]u8 {
+            return if (rates.len == n and n > 0) rates else null;
+        }
+
         /// The wide lane's host scratch, reused across calls.
         const WideScratch = struct {
             ids: std.ArrayList(u16) = .empty,
@@ -890,9 +895,13 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             def_slot: std.ArrayList(u32) = .empty,
             def_act: std.ArrayList(u32) = .empty,
             def_pos: std.ArrayList(u32) = .empty,
+            /// A compact bank's record rates per wave row / deferred row (`PrefillRows.rates`, the per-K prefill route);
+            /// empty for a fixed-rate bank or a source without `recordRates`.
+            rates: std.ArrayList([3]u8) = .empty,
+            def_rates: std.ArrayList([3]u8) = .empty,
 
             fn deinit(w: *WideScratch, a: std.mem.Allocator) void {
-                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.call_pos, &w.wave_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept, &w.loc, &w.def_slot, &w.def_act, &w.def_pos }) |l| l.deinit(a);
+                inline for (.{ &w.ids, &w.first, &w.distinct, &w.count, &w.cold_slot, &w.cold_act, &w.cold_pos, &w.call_pos, &w.wave_pos, &w.slot, &w.act_row, &w.pos, &w.inv, &w.kept, &w.loc, &w.def_slot, &w.def_act, &w.def_pos, &w.rates, &w.def_rates }) |l| l.deinit(a);
                 w.jl.deinit(a);
             }
         };
@@ -1626,7 +1635,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             defer prof.setMode(.stream);
             const kb = w.kept.items.len;
             const b = self.banks[layer][@backingInt(BankKind.base)].?;
-            const rows_: quant.PrefillRows = .{ .slot = w.def_slot.items, .act_row = w.def_act.items };
+            const rows_: quant.PrefillRows = .{ .slot = w.def_slot.items, .act_row = w.def_act.items, .rates = ratesOrNull(w.def_rates.items, w.def_slot.items.len) };
             if (parts) {
                 w.wave_pos.clearRetainingCapacity();
                 try self.math.prefillParts(g, layer, act, rows_, b, a, &w.kept, &w.wave_pos);
@@ -1643,6 +1652,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             w.def_slot.clearRetainingCapacity();
             w.def_act.clearRetainingCapacity();
             w.def_pos.clearRetainingCapacity();
+            w.def_rates.clearRetainingCapacity();
         }
 
         fn runWideCore(self: *Self, g: *G, layer: u32, xf: T, indices: T, n: u32, k: u32, comptime parts: bool) !void {
@@ -1697,6 +1707,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
             w.def_slot.clearRetainingCapacity();
             w.def_act.clearRetainingCapacity();
             w.def_pos.clearRetainingCapacity();
+            w.def_rates.clearRetainingCapacity();
             const n_distinct = w.distinct.items.len;
             // Seed-aligned: the seed's ranks [0, sa) in groups of their own, the stream's after them (sa 0: one run).
             const aligned = self.wide_route.seed_aligned;
@@ -1737,6 +1748,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                     const kb = w.kept.items.len;
                     w.slot.clearRetainingCapacity();
                     w.act_row.clearRetainingCapacity();
+                    w.rates.clearRetainingCapacity();
                     w.cold_slot.clearRetainingCapacity();
                     w.cold_act.clearRetainingCapacity();
                     w.cold_pos.clearRetainingCapacity();
@@ -1746,10 +1758,13 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                         const ref = sv.refs[fi - start];
                         if (ref.bank != kind) continue;
                         const act_row: u32 = @intCast(row / @as(usize, k));
+                        // a compact bank's rows carry their record's rates (the per-K prefill route's wave classes)
+                        const rates: ?[3]u8 = if (comptime @hasDecl(S, "recordRates")) self.source.recordRates(layer, e) else null;
                         if (defer_base and kind == .base) {
                             try w.def_slot.append(a, ref.row);
                             try w.def_act.append(a, act_row);
                             try w.def_pos.append(a, @intCast(row));
+                            if (rates) |r| try w.def_rates.append(a, r);
                             continue;
                         }
                         if (cold > 0 and w.count.items[e] <= cold) {
@@ -1760,6 +1775,7 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                         }
                         try w.slot.append(a, ref.row);
                         try w.act_row.append(a, act_row);
+                        if (rates) |r| try w.rates.append(a, r);
                         if (parts) try w.call_pos.append(a, @intCast(row)) else try w.pos.append(a, @intCast(row));
                     }
                     if (w.slot.items.len == 0 and w.cold_slot.items.len == 0) continue;
@@ -1770,12 +1786,12 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
                         if (parts) {
                             // The waves' outputs as they are; each wave-ordered row's routed position.
                             w.wave_pos.clearRetainingCapacity();
-                            try self.math.prefillParts(g, layer, act, .{ .slot = w.slot.items, .act_row = w.act_row.items }, b, a, &w.kept, &w.wave_pos);
+                            try self.math.prefillParts(g, layer, act, .{ .slot = w.slot.items, .act_row = w.act_row.items, .rates = ratesOrNull(w.rates.items, w.slot.items.len) }, b, a, &w.kept, &w.wave_pos);
                             for (w.wave_pos.items) |p| try w.pos.append(a, w.call_pos.items[p]);
                             w.call_pos.clearRetainingCapacity();
                         } else {
                             try w.kept.ensureUnusedCapacity(a, 1);
-                            const y = try self.math.prefill(g, layer, act, .{ .slot = w.slot.items, .act_row = w.act_row.items }, b);
+                            const y = try self.math.prefill(g, layer, act, .{ .slot = w.slot.items, .act_row = w.act_row.items, .rates = ratesOrNull(w.rates.items, w.slot.items.len) }, b);
                             w.kept.appendAssumeCapacity(y);
                         }
                     }

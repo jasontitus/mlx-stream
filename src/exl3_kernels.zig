@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "054cb7dc6057eef47b7ef3fb7e98b1143778b5f2eb34f8bbffa69083a1eafd38";
+pub const manifest_sha256 = "311922c34c0ea15cb0c5cdee4a075d10a16ca6ddebff8b196e95957eb97c3629";
 
 /// G7: the package's decode-timers build observes each launch of a bound set (its first dispatches per phase, the
 /// observer `Bound.observe` installs); every other build has no observer field, launch key or call.

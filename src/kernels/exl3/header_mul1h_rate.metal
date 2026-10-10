@@ -1201,7 +1201,7 @@ METAL_FUNC void rate_dec_job(const device uint* tile, uint c7, threadgroup half*
 // tile column at a compile-time K (sx_tiles). The K3 path is the K3 kernels' funnel-shift decode verbatim, and every
 // path keeps their acc[m] fma order, so the outputs are bit-identical to the one-simdgroup kernels.
 // SX_NSG is the manifest's threadgroup width / 32 (the grid's threads are unchanged: SX_NSG tile columns per group).
-STEEL_CONST uint SX_NSG = 4u;
+STEEL_CONST uint SX_NSG = 8u;
 
 // xs[0 .. N / 4) = xp[0 .. N) by THREADS threads (tid = thread_index_in_threadgroup), coalesced float4 loads; N a
 // multiple of 4, xp 16-byte aligned (a row of a contiguous [rows, N] f32 array)

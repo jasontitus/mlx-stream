@@ -147,6 +147,8 @@ fn bankedTwinOf(k: Kernel) ?Kernel {
         .dsv41_exl3_b3_moeprep_dpost => .q3_moeprep_dpost,
         .dsv41_exl3_b3_pair_k3_5120 => .dsv41_exl3_pair_k3_5120,
         .dsv41_exl3_b3_guone_k3_2304 => .dsv41_exl3_guone_k3_2304,
+        .dsv41_exl3_b3_pair_k3s_5120 => .dsv41_exl3_pair_k3s_5120,
+        .dsv41_exl3_b3_guone_k3s_2304 => .dsv41_exl3_guone_k3s_2304,
         else => null,
     };
 }
@@ -209,10 +211,16 @@ fn checkBankedTwin(h: *H, k: Kernel) !void {
 /// A routed decode form's `twin` reference: the stock mul1h text of its projection; null for every other kernel.
 fn formTwinOf(k: Kernel) ?Kernel {
     return switch (k) {
-        .dsv41_exl3_pair_k3_5120 => .dsv41_exl3_mul1h_k3_5120,
-        .dsv41_exl3_guone_k3_2304 => .dsv41_exl3_mul1h_k3_2304,
+        .dsv41_exl3_pair_k3_5120, .dsv41_exl3_pair_k3s_5120 => .dsv41_exl3_mul1h_k3_5120,
+        .dsv41_exl3_guone_k3_2304, .dsv41_exl3_guone_k3s_2304 => .dsv41_exl3_mul1h_k3_2304,
         else => null,
     };
+}
+
+/// A strided routed form (code inputs shaped by the bank's physical tile row): its device twin runs at the tight
+/// 48-short stride, where the stock text reads the same arrays; the padded stride is covered by CPU emulation.
+fn stridedForm(k: Kernel) bool {
+    return k == .dsv41_exl3_pair_k3s_5120 or k == .dsv41_exl3_guone_k3s_2304;
 }
 
 /// A wave's slot runs for the form twins: single rows, pairs, odd and even runs.
@@ -231,6 +239,9 @@ fn checkFormTwin(h: *H, k: Kernel) !void {
     for (form_twin_runs) |r| rows += r;
     vars.set(.rows, rows);
     vars.set(.cap, 16);
+    if (stridedForm(k)) {
+        inline for (.{ Var.code_words, Var.code0_words, Var.code1_words, Var.code2_words }) |vcode| vars.set(vcode, 48);
+    }
     var svars = defaultVars(es);
     svars.set(.rows, rows);
     svars.set(.cap, 16);
@@ -247,7 +258,7 @@ fn checkFormTwin(h: *H, k: Kernel) !void {
     const id_arr = try fromHost(&sc, std.mem.sliceAsBytes(ids[0..n]), &shape, .uint32);
     var bad: u64 = 0;
     var words: u64 = 0;
-    if (k == .dsv41_exl3_pair_k3_5120) {
+    if (k == .dsv41_exl3_pair_k3_5120 or k == .dsv41_exl3_pair_k3s_5120) {
         ins[1] = id_arr;
         sins[0] = ins[0];
         sins[1] = id_arr;

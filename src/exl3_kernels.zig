@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "1abde80aab3239ffeef6904e80c84156f62ebd3a076a94418005c117228b91f5";
+pub const manifest_sha256 = "9ec98929484afb72a5efc1d9d8a506a4048f8de33894e0db0eb2008a4a657db2";
 
 /// G7: the package's decode-timers build observes each launch of a bound set (its first dispatches per phase, the
 /// observer `Bound.observe` installs); every other build has no observer field, launch key or call.
@@ -159,6 +159,12 @@ pub const Kernel = enum {
     dsv41_exl3_b3_pair_k3_5120,
     dsv41_exl3_b3_guone_k3_2304,
     dsv41_jl_combine_bf16,
+    // The strided routed forms (Pollard): the form texts reading K3 banks through their physical expert stride
+    // (code_*_strides[0]), so a padded K3 projection keeps gu_one / down_pair (twins: the tight texts' stock mul1h)
+    dsv41_exl3_guone_k3s_2304,
+    dsv41_exl3_pair_k3s_5120,
+    dsv41_exl3_b3_guone_k3s_2304,
+    dsv41_exl3_b3_pair_k3s_5120,
     // Direct rate-specialized paths use each code array's physical expert stride.
     dsv41_exl3_mul1h_rate_2304,
     dsv41_exl3_mul1h_rate_2304__k3,

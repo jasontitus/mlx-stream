@@ -822,7 +822,7 @@ pub const Module = struct {
         self.installed.head_mxfp8_rc = self.model.head_mx != null;
         self.installed.routed_forms = self.exl3.forms;
         self.installed.routed_banked = self.exl3.banked != null;
-        log.info("NATIVE routed forms installed: down_pair {}, gu_one {}, banked {}\n", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one, self.installed.routed_banked });
+        log.info("NATIVE routed forms installed: down_pair {}, gu_one {}, strided {}, banked {}\n", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one, self.installed.routed_forms.strided, self.installed.routed_banked });
         self.installed.dense_rc = self.model.tier.routes.dense_rc;
         if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch); stacked {d} B built, the originals dropped\n", .{graph.sharedGateUpBytes(&self.model.c)});
         log.info("{s}\n", .{self.installed.decodeSites(&line_buf)});

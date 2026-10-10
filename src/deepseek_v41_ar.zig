@@ -656,7 +656,8 @@ fn readState(a: std.mem.Allocator, lines: *std.ArrayList(LayerStateLine), m: *mo
     }
 }
 
-/// DSV41_CELL_ROUTED_FORMS: "stock" or a comma list of down_pair / gu_one (each at most once), refused by name.
+/// DSV41_CELL_ROUTED_FORMS: "stock" or a comma list of down_pair / gu_one / strided (each at most once), refused by
+/// name. `strided` keeps the set forms on padded K3 banks (the strided form texts); alone it routes nothing.
 pub fn parseForms(v: []const u8) !xq.Forms {
     var f: xq.Forms = .{};
     if (std.mem.eql(u8, v, "stock")) return f;
@@ -666,16 +667,18 @@ pub fn parseForms(v: []const u8) !xq.Forms {
             f.down_pair = true;
         } else if (std.mem.eql(u8, tok, "gu_one") and !f.gu_one) {
             f.gu_one = true;
+        } else if (std.mem.eql(u8, tok, "strided") and !f.strided) {
+            f.strided = true;
         } else return error.CellRoutedForms;
     }
     return f;
 }
 
 pub fn formsName(f: xq.Forms) []const u8 {
-    if (f.down_pair and f.gu_one) return "down_pair,gu_one";
-    if (f.down_pair) return "down_pair";
-    if (f.gu_one) return "gu_one";
-    return "stock";
+    if (f.down_pair and f.gu_one) return if (f.strided) "down_pair,gu_one,strided" else "down_pair,gu_one";
+    if (f.down_pair) return if (f.strided) "down_pair,strided" else "down_pair";
+    if (f.gu_one) return if (f.strided) "gu_one,strided" else "gu_one";
+    return if (f.strided) "strided" else "stock";
 }
 
 test "dsv41 ar: DSV41_CELL_ROUTED_FORMS parses each form once, stock, and refuses the rest by name" {
@@ -683,8 +686,10 @@ test "dsv41 ar: DSV41_CELL_ROUTED_FORMS parses each form once, stock, and refuse
     try std.testing.expectEqual(xq.Forms{ .down_pair = true }, try parseForms("down_pair"));
     try std.testing.expectEqual(xq.Forms{ .gu_one = true }, try parseForms("gu_one"));
     try std.testing.expectEqual(xq.Forms{ .down_pair = true, .gu_one = true }, try parseForms("gu_one,down_pair"));
-    for ([_][]const u8{ "", "pair", "down_pair,down_pair", "down_pair,", "stock,gu_one" }) |bad| try std.testing.expectError(error.CellRoutedForms, parseForms(bad));
+    try std.testing.expectEqual(xq.Forms{ .down_pair = true, .gu_one = true, .strided = true }, try parseForms("gu_one,strided,down_pair"));
+    for ([_][]const u8{ "", "pair", "down_pair,down_pair", "down_pair,", "stock,gu_one", "strided,strided" }) |bad| try std.testing.expectError(error.CellRoutedForms, parseForms(bad));
     try std.testing.expectEqualStrings("down_pair,gu_one", formsName(.{ .down_pair = true, .gu_one = true }));
+    try std.testing.expectEqualStrings("down_pair,gu_one,strided", formsName(.{ .down_pair = true, .gu_one = true, .strided = true }));
     try std.testing.expectEqualStrings("stock", formsName(.{}));
 }
 

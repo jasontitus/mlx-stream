@@ -79,10 +79,17 @@ pub const kernels = [_]Kernel{
     .dsv41_exl3_b3_moeprep_dpost,
     .dsv41_exl3_b3_pair_k3_5120,
     .dsv41_exl3_b3_guone_k3_2304,
+    .dsv41_exl3_guone_k3s_2304,
+    .dsv41_exl3_pair_k3s_5120,
+    .dsv41_exl3_b3_guone_k3s_2304,
+    .dsv41_exl3_b3_pair_k3s_5120,
 } ++ xk.rate_kernels;
 
 /// The routed decode forms (`DSV41_CELL_ROUTED_FORMS`): each independently selectable, chosen at construction.
-pub const Forms = struct { down_pair: bool = false, gu_one: bool = false };
+/// `strided`: the set forms also serve K3 projections in padded banks (a mixed pack's transient rows, a [3, 3, 4]
+/// layer's K3 gate / up beside its K4 down) through the strided form texts (`dsv41_exl3_*_k3s_*`, the tight texts
+/// reading the code arrays' physical expert stride); off, those projections take the direct rate plans.
+pub const Forms = struct { down_pair: bool = false, gu_one: bool = false, strided: bool = false };
 
 /// One projection's per-slot arrays: the streamer's `ProjArrays` {code, rout, rin}.
 pub fn Arrays(comptime T: type) type {
@@ -394,12 +401,13 @@ pub const w1_texts = [_]Kernel{.dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1
 const lut_texts = [_]Kernel{.dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut};
 /// The routed decode forms: installed at construction by `Accepted.routeForms` (their twins are registry checks, run in
 /// a check window and by kbench v9); the stock accept neither routes nor checks them.
-pub const form_texts = [_]Kernel{ .dsv41_exl3_pair_k3_5120, .dsv41_exl3_guone_k3_2304 };
+pub const form_texts = [_]Kernel{ .dsv41_exl3_pair_k3_5120, .dsv41_exl3_guone_k3_2304, .dsv41_exl3_pair_k3s_5120, .dsv41_exl3_guone_k3s_2304 };
 /// The banked route's texts: installed at construction by `Accepted.routeBanked` (their twins are registry checks, run
 /// in a check window and by kbench v6d / v9b); the stock accept neither routes nor checks them.
 pub const banked_texts = [_]Kernel{
-    .dsv41_exl3_b3_mul1h_k3_2304, .dsv41_exl3_b3_mul1h_k3_5120, .dsv41_exl3_b3_prep_in_rin,  .dsv41_exl3_b3_prep_gu_epi,
-    .dsv41_exl3_b3_prep_din_rin,  .dsv41_exl3_b3_moeprep_dpost, .dsv41_exl3_b3_pair_k3_5120, .dsv41_exl3_b3_guone_k3_2304,
+    .dsv41_exl3_b3_mul1h_k3_2304, .dsv41_exl3_b3_mul1h_k3_5120,  .dsv41_exl3_b3_prep_in_rin,  .dsv41_exl3_b3_prep_gu_epi,
+    .dsv41_exl3_b3_prep_din_rin,  .dsv41_exl3_b3_moeprep_dpost,  .dsv41_exl3_b3_pair_k3_5120, .dsv41_exl3_b3_guone_k3_2304,
+    .dsv41_exl3_b3_pair_k3s_5120, .dsv41_exl3_b3_guone_k3s_2304,
 };
 pub const checked_at_accept = blk: {
     @setEvalBranchQuota(4000);
@@ -548,6 +556,12 @@ pub fn Gemv(comptime G: type) type {
         gu1_p: ?RowPlans(G, 48) = null,
         /// The gate / up call bound at construction: `guOne` (gu_one's one launch) or `guPair` (the two stock launches).
         gu_call: *const GuCall = guPair,
+        /// strided: the set forms on padded K3 banks (`dsv41_exl3_guone_k3s_2304`, `dsv41_exl3_pair_k3s_5120`; their
+        /// words are the stock texts', the registry's twins), bound by `initRates`; null: padded K3 takes the rate plans.
+        gu1s_p: ?RowPlans(G, 48) = null,
+        dns_p: ?RowPlans(G, 48) = null,
+        dns_e: *const Entry = undefined,
+        dns_statics: Statics(G) = .{},
         rate_mask: u3 = 0,
         rate_a: Allocator,
         rate_gu: [3]?*RowPlans(G, 48) = @splat(null),
@@ -576,9 +590,16 @@ pub fn Gemv(comptime G: type) type {
             errdefer dn_p.deinit(g);
             var gu1_p: ?RowPlans(G, 48) = if (forms.gu_one) try RowPlans(G, 48).init(g, reg.get(.dsv41_exl3_guone_k3_2304), null, null) else null;
             errdefer if (gu1_p) |*x| x.deinit(g);
+            var gu1s_p: ?RowPlans(G, 48) = if (forms.strided and forms.gu_one) try RowPlans(G, 48).init(g, reg.get(.dsv41_exl3_guone_k3s_2304), null, null) else null;
+            errdefer if (gu1s_p) |*x| x.deinit(g);
+            const dns_e = reg.get(.dsv41_exl3_pair_k3s_5120);
+            var dns_p: ?RowPlans(G, 48) = if (forms.strided and forms.down_pair) try RowPlans(G, 48).init(g, dns_e, null, null) else null;
+            errdefer if (dns_p) |*x| x.deinit(g);
+            var dns_statics: Statics(G) = if (dns_p != null) try Statics(G).init(g, dns_e) else .{};
+            errdefer dns_statics.deinit(g);
             var gs = try Statics(G).init(g, gu);
             errdefer gs.deinit(g);
-            var self: Self = .{ .gu = gu, .dn = dn, .gu_statics = gs, .dn_statics = try Statics(G).init(g, dn), .gu_p = gu_p, .dn_p = dn_p, .gu1_p = gu1_p, .gu_call = if (forms.gu_one) guOne else guPair, .rate_mask = rate_mask, .rate_a = a };
+            var self: Self = .{ .gu = gu, .dn = dn, .gu_statics = gs, .dn_statics = try Statics(G).init(g, dn), .gu_p = gu_p, .dn_p = dn_p, .gu1_p = gu1_p, .gu_call = if (forms.gu_one) guOne else guPair, .gu1s_p = gu1s_p, .dns_p = dns_p, .dns_e = dns_e, .dns_statics = dns_statics, .rate_mask = rate_mask, .rate_a = a };
             errdefer {
                 self.dn_statics.deinit(g);
                 freeRatePlans(G, a, g, &self.rate_gu);
@@ -599,16 +620,28 @@ pub fn Gemv(comptime G: type) type {
             self.gu_p.deinit(g);
             self.dn_p.deinit(g);
             if (self.gu1_p) |*x| x.deinit(g);
+            if (self.gu1s_p) |*x| x.deinit(g);
+            if (self.dns_p) |*x| x.deinit(g);
             self.gu_statics.deinit(g);
             self.dn_statics.deinit(g);
+            self.dns_statics.deinit(g);
             freeRatePlans(G, self.rate_a, g, &self.rate_gu);
             freeRatePlans(G, self.rate_a, g, &self.rate_dn);
         }
 
-        /// Tight K3 keeps its installed form; other layouts use their prepared direct-rate plans.
+        /// Tight K3 keeps its installed form; padded K3 takes the strided gu_one when bound; other layouts use their
+        /// prepared direct-rate plans.
         pub fn projectGu(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T, lg: ProjectionLayout, lu: ProjectionLayout) ![2]G.T {
-            if (lg.k != 3 or lu.k != 3 or !lg.tight() or !lu.tight())
+            if (lg.k != 3 or lu.k != 3)
                 return .{ try self.project(g, .gate, xg, ids, code_g, lg), try self.project(g, .up, xu, ids, code_u, lu) };
+            if (!lg.tight() or !lu.tight()) {
+                if (self.gu1s_p) |*p| {
+                    var out: [2]G.T = undefined;
+                    try p.launch(g, rowsOf(G, g, xg, 0), &.{ xg, xu, ids, code_g, code_u }, &out);
+                    return out;
+                }
+                return .{ try self.project(g, .gate, xg, ids, code_g, lg), try self.project(g, .up, xu, ids, code_u, lu) };
+            }
             return self.gu_call(self, g, xg, xu, ids, code_g, code_u);
         }
 
@@ -625,14 +658,16 @@ pub fn Gemv(comptime G: type) type {
         /// xh [rows, in] f32 (rotated), ids [rows] u32 (each row's slot), code = the projection's
         /// bank code -> z [rows, out] f32 (gate / up: out 2304, down: out 5120).
         pub fn project(self: *const Self, g: *G, proj: Proj, xh: G.T, ids: G.T, code: G.T, layout: ProjectionLayout) !G.T {
-            const direct = layout.k != 3 or !layout.tight();
+            // padded K3 down with the strided down_pair bound: the pair text through the bank's stride
+            const strided = proj == .down and layout.k == 3 and !layout.tight() and self.dns_p != null;
+            const direct = (layout.k != 3 or !layout.tight()) and !strided;
             const index = layout.k - 2;
-            const p: *const RowPlans(G, 48) = if (direct) blk: {
+            const p: *const RowPlans(G, 48) = if (strided) &self.dns_p.? else if (direct) blk: {
                 const plans = if (proj == .down) &self.rate_dn[index] else &self.rate_gu[index];
                 break :blk plans.* orelse return error.RateNotPrepared;
             } else if (proj == .down) &self.dn_p else &self.gu_p;
-            const e = if (direct) (if (proj == .down) self.rate_dn_e[index] else self.rate_gu_e[index]) else (if (proj == .down) self.dn else self.gu);
-            const st = if (proj == .down) &self.dn_statics else &self.gu_statics;
+            const e = if (strided) self.dns_e else if (direct) (if (proj == .down) self.rate_dn_e[index] else self.rate_gu_e[index]) else (if (proj == .down) self.dn else self.gu);
+            const st = if (strided) &self.dns_statics else if (proj == .down) &self.dn_statics else &self.gu_statics;
             var ins: [9]G.T = undefined;
             ins[0] = xh;
             ins[1] = ids;
@@ -675,6 +710,11 @@ pub fn Banked(comptime G: type) type {
         rate_dn_e: [3]*const Entry = undefined,
         rate_gu_st: [xk.max_inputs]G.T = undefined,
         rate_dn_st: [xk.max_inputs]G.T = undefined,
+        /// strided forms (the installed `Gemv`'s): the banked strided gu_one and pair texts, for K3 banks of any stride
+        gu_s_p: ?RowPlans(G, 48) = null,
+        dn_s_p: ?RowPlans(G, 48) = null,
+        dn_s_e: *const Entry = undefined,
+        dn_s_st: [xk.max_inputs]G.T = undefined,
 
         const GuCall = fn (self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T;
 
@@ -709,6 +749,15 @@ pub fn Banked(comptime G: type) type {
                     self.rate_dn[i] = try allocRatePlan(G, self.rate_a, g, self.rate_dn_e[i]);
                 }
             }
+            // The strided forms, as the installed GEMV bound them (gu_one has no statics; the pair text's are the
+            // installed strided pair's).
+            if (gemv.gu1s_p != null) self.gu_s_p = try RowPlans(G, 48).init(g, reg.get(.dsv41_exl3_b3_guone_k3s_2304), null, null);
+            errdefer if (self.gu_s_p) |*x| x.deinit(g);
+            if (gemv.dns_p != null) {
+                self.dn_s_e = reg.get(.dsv41_exl3_b3_pair_k3s_5120);
+                try alias(self.dn_s_e, gemv.dns_e, &gemv.dns_statics, &self.dn_s_st);
+                self.dn_s_p = try RowPlans(G, 48).init(g, self.dn_s_e, null, null);
+            }
             return self;
         }
 
@@ -738,6 +787,8 @@ pub fn Banked(comptime G: type) type {
             self.dpost_p.deinit(g);
             self.gu_p.deinit(g);
             self.dn_p.deinit(g);
+            if (self.gu_s_p) |*x| x.deinit(g);
+            if (self.dn_s_p) |*x| x.deinit(g);
             freeRatePlans(G, self.rate_a, g, &self.rate_gu);
             freeRatePlans(G, self.rate_a, g, &self.rate_dn);
         }
@@ -750,6 +801,12 @@ pub fn Banked(comptime G: type) type {
             return true;
         }
 
+        /// K3 in every bank, at any physical stride (the strided forms' banks).
+        fn k3Banks(comptime proj: Proj, banks: *const [3]BA) bool {
+            for (banks) |b| if (@field(b, @tagName(proj)).layout.k != 3) return false;
+            return true;
+        }
+
         /// x [tokens, 5120] bf16 (taken rows), tok [rows] i32, ids packed -> the clamped SwiGLU [rows, 2304] f32.
         pub fn gateUp(self: *const Self, g: *G, x: G.T, tok: G.T, ids: G.T, banks: *const [3]BA) !G.T {
             const rows = rowsOf(G, g, tok, 0);
@@ -757,6 +814,8 @@ pub fn Banked(comptime G: type) type {
             try self.in_rin_p.launch(g, rows, &.{ x, tok, banks[0].gate.rin, banks[1].gate.rin, banks[2].gate.rin, banks[0].up.rin, banks[1].up.rin, banks[2].up.rin, ids }, &xs);
             const z = if (tightBanks(.gate, banks) and tightBanks(.up, banks))
                 try self.gu_call(self, g, xs[0], xs[1], ids, banks)
+            else if (self.gu_s_p != null and k3Banks(.gate, banks) and k3Banks(.up, banks))
+                try self.guOneStrided(g, xs[0], xs[1], ids, banks)
             else
                 try self.guPair(g, xs[0], xs[1], ids, banks);
             var out: [1]G.T = undefined;
@@ -769,11 +828,12 @@ pub fn Banked(comptime G: type) type {
             const rows = rowsOf(G, g, h, 0);
             var hd: [1]G.T = undefined;
             try self.din_rin_p.launch(g, rows, &.{ h, banks[0].down.rin, banks[1].down.rin, banks[2].down.rin, ids }, &hd);
-            const direct = !tightBanks(.down, banks);
+            const strided = !tightBanks(.down, banks) and self.dn_s_p != null and k3Banks(.down, banks);
+            const direct = !tightBanks(.down, banks) and !strided;
             const index = banks[0].down.layout.k - 2;
-            const plan: *const RowPlans(G, 48) = if (direct) (self.rate_dn[index] orelse return error.RateNotPrepared) else &self.dn_p;
-            const entry = if (direct) self.rate_dn_e[index] else self.dn_e;
-            var ins: [xk.max_inputs]G.T = if (direct) self.rate_dn_st else self.dn_st;
+            const plan: *const RowPlans(G, 48) = if (strided) &self.dn_s_p.? else if (direct) (self.rate_dn[index] orelse return error.RateNotPrepared) else &self.dn_p;
+            const entry = if (strided) self.dn_s_e else if (direct) self.rate_dn_e[index] else self.dn_e;
+            var ins: [xk.max_inputs]G.T = if (strided) self.dn_s_st else if (direct) self.rate_dn_st else self.dn_st;
             ins[0] = hd[0];
             ins[1] = ids;
             ins[2] = banks[0].down.code;
@@ -810,6 +870,13 @@ pub fn Banked(comptime G: type) type {
         fn guOne(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T {
             var out: [2]G.T = undefined;
             try self.gu_p.launch(g, rowsOf(G, g, xg, 0), &.{ xg, xu, ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code }, &out);
+            return out;
+        }
+
+        /// gu_one on K3 banks of any stride: the banked strided text (`gu_s_p`, bound when the forms are strided).
+        fn guOneStrided(self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T {
+            var out: [2]G.T = undefined;
+            try self.gu_s_p.?.launch(g, rowsOf(G, g, xg, 0), &.{ xg, xu, ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].up.code, banks[1].up.code, banks[2].up.code }, &out);
             return out;
         }
     };

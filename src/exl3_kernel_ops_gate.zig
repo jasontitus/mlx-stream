@@ -1305,6 +1305,7 @@ test "dsv41 kernels ops gpu: accepted routed forms and carried BF16 mixed expert
         .{ .gu_one = true },
         .{ .down_pair = true },
         .{ .gu_one = true, .down_pair = true },
+        .{ .gu_one = true, .down_pair = true, .strided = true },
     };
     for ([_][3]u32{ .{ 3, 3, 3 }, .{ 3, 3, 4 }, .{ 2, 4, 3 }, .{ 4, 2, 4 } }) |rates| {
         const bank_mark = g.mark();

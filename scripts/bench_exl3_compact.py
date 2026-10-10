@@ -341,6 +341,32 @@ def bench_fixed_decode(trees, args, rng, rows_out):
                                         return launch(trees[0], pair, {"xh": xh, "ids": mx.sort(picks[i]), "code": banks[0].tight}, {"rows": rows, "cap": args.cap})
                                     sec, out = timed(make_pair, args.iters)
                                     report(rows_out, case, "ref pair_k3 (sorted ids)", sec, nbytes, base_t, "-")
+                            # the strided forms (opt/pollard-tight-forms): the same forms through the bank's own stride
+                            for tree in trees:
+                                s_gu = "dsv41_exl3_b3_guone_k3s_2304" if banked else "dsv41_exl3_guone_k3s_2304"
+                                s_pair = "dsv41_exl3_b3_pair_k3s_5120" if banked else "dsv41_exl3_pair_k3s_5120"
+                                if shape == "2304" and s_gu in tree.specs:
+                                    def make_sgu(i, tree=tree):
+                                        a = {"xh_g": xh, "xh_u": xh}
+                                        if banked:
+                                            a["ids"] = picks[i] | mx.array((np.arange(rows) % 3 << 24).astype(np.uint32))
+                                            a.update({f"code_g{b}": banks[b].code for b in range(3)}, **{f"code_u{b}": banks[b].code for b in range(3)})
+                                        else:
+                                            a.update(ids=picks[i], code_g=banks[0].code, code_u=banks[1].code)
+                                        return launch(tree, s_gu, a, vs)
+                                    sec, out = timed(make_sgu, args.iters)
+                                    report(rows_out, case, f"{tree.label} {s_gu[11:]} (gate+up)", sec, 2 * nbytes, 2 * base_t, same(first, out[:1]))
+                                if shape == "5120" and s_pair in tree.specs:
+                                    def make_spair(i, tree=tree):
+                                        a = {"xh": xh}
+                                        if banked:
+                                            a["ids"] = mx.sort(picks[i]) | mx.array((np.arange(rows) % 3 << 24).astype(np.uint32))
+                                            a.update({f"code{b}": banks[b].code for b in range(3)})
+                                        else:
+                                            a.update(ids=mx.sort(picks[i]), code=banks[0].code)
+                                        return launch(tree, s_pair, a, vs)
+                                    sec, out = timed(make_spair, args.iters)
+                                    report(rows_out, case, f"{tree.label} {s_pair[11:]} (sorted ids)", sec, nbytes, base_t, "-")
                 del banks
 
 

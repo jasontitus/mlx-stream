@@ -35,7 +35,8 @@ effects are real; combining winners is a separate step (below).
 | `opt/decode-hoist` | decode | K dispatch hoisted out of the tk loop only; K2/K4/K5 windows still read one at a time. Isolates the dispatch / register effect. | no | pushed; CPU harness bit-identical (20 kernel cases, 1.07M outputs) |
 | `opt/decode-wordcache` | decode | the hoist plus a per-lane word cache: K2/K4/K5 lanes load 2 words per tile (3 for K5) and funnel-shift them, like the K3 path. Also covers the fixed-rate `_rate_` decode kernels. | no | pushed; same harness, bit-identical |
 | `opt/decode-per-k` | decode | one compile-time-K launch per rate present; other threadgroups exit early | yes | agent running |
-| `opt/decode-staged-x` | decode | 4 simdgroups per threadgroup share the activation row staged in threadgroup memory; K hoisted | no (manifest geometry) | agent running |
+| `opt/decode-staged-x` | decode | 4 simdgroups per threadgroup share the activation row staged in threadgroup memory (20 KB for the 2304-out kernel, 9 KB for 5120-out); K hoisted. Removes the 8 scattered activation loads per lane per tile; costs a serialized staging prologue and, at 20 KB, only one 2304-out group per core if the budget is 32 KB. | no (manifest `threadgroup` 32 -> 128) | pushed; CPU harness bit-identical (all four kernels, 5 seeds, rows 1-9, sentinel rows) |
+| `opt/decode-staged-x8` | decode | the same at 8 simdgroups per threadgroup (`threadgroup` 256): twice the resident simdgroups per KB of staged memory. Its author's pick for the 2304-out kernel. | no | pushed; same harness passes at NSG 8 |
 
 The two `per-k` branches add kernels and a construction-time switch; their report (in the branch's commit
 message and the agent summary pasted into the PR or here) names the switch. Everything else is a drop-in text
@@ -104,7 +105,7 @@ All non-per-k branches in one invocation so they share codes, clocks and thermal
 python3 scripts/bench_exl3_compact.py \
     opt/exl3-compact-tools \
     opt/prefill-wordcache opt/prefill-prefetch opt/prefill-staged-words \
-    opt/decode-hoist opt/decode-wordcache opt/decode-staged-x \
+    opt/decode-hoist opt/decode-wordcache opt/decode-staged-x opt/decode-staged-x8 \
     --mix-from <spark-repack>/expert-manifest-v3.json \
     --rows 1,8,48 --json bench-$(date +%Y%m%d-%H%M).json
 ```
@@ -180,5 +181,5 @@ change or `Registry.init` refuses the load by name.
   kernel body (32 lanes per threadgroup, Metal's half fma emulated with a single rounding). Those harnesses are in
   the Linux session's scratchpad, not in the repo; the device checks above supersede them.
 - Not known: whether the Metal compiler accepts each text, register pressure (K5 keeps 6 code words live in
-  prefill; the decode word cache keeps 3), occupancy under staged-x's 20 KB threadgroup footprint, and every
+  prefill; the decode word cache keeps 3), occupancy under staged-x's 20 KB threadgroup footprint (the two NSG branches bracket it), and every
   number in this document's tables. Expect at least one branch to need a compile fix.

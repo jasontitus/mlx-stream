@@ -164,6 +164,42 @@ the GEMM branches show. If the kernels are near the K3 ceiling in tier 3 but the
 more than the byte ratio explains, look at the read pool and admission (`src/expert_stream.zig`,
 `src/expert_admission.zig`) next, not the kernels.
 
+## Pollard 3.5 (fixed per-projection rates)
+
+Pollard is a v2 bank with `projection_K` triples such as [3, 3, 4] per layer. It takes the fixed-rate path, not the
+compact one, so the analysis and candidates live on branches off `origin/feat/exl3-integer-rates` (the parent of the
+mixed-experts work; the `_rate_` kernel texts are byte-identical on both). The write-up is
+`docs/pollard-rates-perf.md` on `opt/pollard-rates`. The short version: per tile, a padded K3 projection costs
+nothing extra (the `__k3` rate variant is the tight text plus one stride read), but one K4 projection anywhere in the
+pack widens the shared transient bank, and under the banked decode route that makes **every** layer lose the
+`gu_one` / `down_pair` fused forms; the K4 down itself pays the slow `rate_window<4>` path (11 loads per lane per tile
+vs 2) and in prefill loses the fused down GEMM.
+
+| branch | what it changes | status |
+|---|---|---|
+| `opt/pollard-rates` | the analysis doc only | pushed |
+| `opt/pollard-wordcache` | the fixed-rate halves of `opt/decode-wordcache` and `opt/prefill-wordcache` ported onto integer-rates (the four `_rate_` decode texts, `rate_dec_job`), plus the two scripts; `bench_exl3_compact.py --fixed` times the `_rate_` kernels at K2/K3/K4 on tight and padded banks against the tight-K3 kernels and forms | pushed; CPU harness bit-identical (36 decode cases on odd / 64-word padded strides, 22M window comparisons, ~1.4M prefill jobs per codebook mode) |
+| `opt/pollard-tight-forms` | on top of wordcache: stride-parameterised copies of the `gu_one` / `down_pair` forms (`*_k3s_*` texts) so padded K3 projections keep the fused forms; `DSV41_CELL_ROUTED_FORMS=down_pair,gu_one,strided` | pushed; CPU harness: strided forms vs tight forms vs stock K3 bit-identical (48 cases); Zig fmt / ast-check only, not built |
+
+Not built: a K4-specific window path (`gemv_lane_windows<4>` from the word cache is already the aligned two-word
+read, nothing left to specialise) and a fused down GEMM for K4 (`_rate_m128w1` text is mechanical, the routing is
+not; design in the doc).
+
+Testing is the same four tiers with these commands:
+
+```sh
+# tier 1 / 2 on each branch as above (repin --check, compile_kernels_offline.py, pre-ship gate, exl3 mixed gate)
+# tier 3: fixed-rate microbench, from the opt/pollard-wordcache (or later) script
+python3 scripts/bench_exl3_compact.py --fixed opt/pollard-rates opt/pollard-wordcache opt/pollard-tight-forms \
+    --rows 1,8,48 --json bench-pollard-$(date +%Y%m%d-%H%M).json
+# tier 4: the 16K cell on the Pollard repack, baseline vs. each branch (strided forms need the ROUTED_FORMS value above)
+```
+
+Read the `--fixed` rows the same way: `K4` rows against the baseline show the word cache; `padded K3` rows on
+`opt/pollard-tight-forms` with the `strided` forms should land on the tight-K3 `ref` rows (`guone_k3`, `pair_k3`) -
+that is the whole point of that branch. The Spark branches and the Pollard branches share the same kernel header
+hunks, so once both sides have winners, the fixed-rate hunks merge onto whichever base ships.
+
 ## Composing winners
 
 Each candidate is a separate branch off the same base, so a combination is a merge:

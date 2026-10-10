@@ -144,7 +144,8 @@ pub const RouteOverrides = struct {
     /// matmul; needs head_mode mxfp8. Rounding-class like the codec itself. null: the default, off.
     head_mxfp8_rc: ?bool = null,
     /// ROUTED_FORMS (kbench v9, exact): the routed decode GEMVs' forms, each independently: down_pair (the down
-    /// projection's pair text) and gu_one (gate and up in one launch). null: stock.
+    /// projection's pair text) and gu_one (gate and up in one launch) on fixed-K3 storage, per_k (one compile-time-K
+    /// launch per rate, chained) on compact storage. null: stock.
     routed_forms: ?xq.Forms = null,
     /// DENSE_RC (kbench v7 / v7b): the shared gate | up stacked on RCPROJ, one launch (C29's other sites stay on
     /// m1rows). Rounding-class (the head keeps C11's m1rows). null: off.
@@ -202,7 +203,7 @@ pub fn growFill(ov: RouteOverrides) expert_stream.GrowFill {
 pub const stack4_forms: xq.Forms = .{ .down_pair = true, .gu_one = true };
 pub fn formsRoute(ov: RouteOverrides, stack4: bool) ?xq.Forms {
     const f = ov.routed_forms orelse if (stack4) stack4_forms else xq.Forms{};
-    return if (f.down_pair or f.gu_one) f else null;
+    return if (f.down_pair or f.gu_one or f.per_k) f else null;
 }
 
 test "dsv41 module: the routed forms rebuild the GEMVs only when a form is set" {
@@ -212,6 +213,7 @@ test "dsv41 module: the routed forms rebuild the GEMVs only when a form is set" 
         try std.testing.expectEqual(xq.Forms{ .gu_one = true }, formsRoute(.{ .routed_forms = .{ .gu_one = true } }, s4).?);
         try std.testing.expectEqual(xq.Forms{ .down_pair = true }, formsRoute(.{ .routed_forms = .{ .down_pair = true } }, s4).?);
         try std.testing.expectEqual(xq.Forms{ .down_pair = true, .gu_one = true }, formsRoute(.{ .routed_forms = .{ .down_pair = true, .gu_one = true } }, s4).?);
+        try std.testing.expectEqual(xq.Forms{ .per_k = true }, formsRoute(.{ .routed_forms = .{ .per_k = true } }, s4).?);
     }
     // unset: stack4's forms when it is the default, else the accept-time GEMVs
     try std.testing.expect(formsRoute(.{}, false) == null);
@@ -659,6 +661,8 @@ pub const Module = struct {
         if (formsRoute(ov, config.dsv41DecodeStack4())) |f| {
             var kd: xk.Diag = .{};
             self.exl3.compileTexts(self.set, &xq.form_texts, &kd) catch |e| return refused(refuse(&diag, e, "exl3 routed forms: {s}", .{kd.message()}), &diag);
+            // per_k's chain texts compile only where they route: compact storage.
+            if (f.per_k and self.exl3.compact) self.exl3.compileTexts(self.set, &xk.compactk_kernels, &kd) catch |e| return refused(refuse(&diag, e, "exl3 routed per_k: {s}", .{kd.message()}), &diag);
             try self.exl3.routeForms(&self.g, f);
         }
         // The banked route, when overridden: after the forms (it aliases their GEMVs' statics); the hook binds its waves.
@@ -824,7 +828,7 @@ pub const Module = struct {
         self.installed.head_mxfp8_rc = self.model.head_mx != null;
         self.installed.routed_forms = self.exl3.forms;
         self.installed.routed_banked = self.exl3.banked != null;
-        log.info("NATIVE routed forms installed: down_pair {}, gu_one {}, banked {}\n", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one, self.installed.routed_banked });
+        log.info("NATIVE routed forms installed: down_pair {}, gu_one {}, per_k {}, banked {}\n", .{ self.installed.routed_forms.down_pair, self.installed.routed_forms.gu_one, self.installed.routed_forms.per_k, self.installed.routed_banked });
         self.installed.dense_rc = self.model.tier.routes.dense_rc;
         if (self.installed.dense_rc) log.info("NATIVE dense rc installed: shared gate|up stacked on RCPROJ (one launch); stacked {d} B built, the originals dropped\n", .{graph.sharedGateUpBytes(&self.model.c)});
         log.info("{s}\n", .{self.installed.decodeSites(&line_buf)});

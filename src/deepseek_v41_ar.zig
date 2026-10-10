@@ -656,7 +656,7 @@ fn readState(a: std.mem.Allocator, lines: *std.ArrayList(LayerStateLine), m: *mo
     }
 }
 
-/// DSV41_CELL_ROUTED_FORMS: "stock" or a comma list of down_pair / gu_one (each at most once), refused by name.
+/// DSV41_CELL_ROUTED_FORMS: "stock" or a comma list of down_pair / gu_one / per_k (each at most once), refused by name.
 pub fn parseForms(v: []const u8) !xq.Forms {
     var f: xq.Forms = .{};
     if (std.mem.eql(u8, v, "stock")) return f;
@@ -666,26 +666,33 @@ pub fn parseForms(v: []const u8) !xq.Forms {
             f.down_pair = true;
         } else if (std.mem.eql(u8, tok, "gu_one") and !f.gu_one) {
             f.gu_one = true;
+        } else if (std.mem.eql(u8, tok, "per_k") and !f.per_k) {
+            f.per_k = true;
         } else return error.CellRoutedForms;
     }
     return f;
 }
 
+/// The forms as a comma list in `parseForms`' order (down_pair, gu_one, per_k), "stock" for none.
 pub fn formsName(f: xq.Forms) []const u8 {
-    if (f.down_pair and f.gu_one) return "down_pair,gu_one";
-    if (f.down_pair) return "down_pair";
-    if (f.gu_one) return "gu_one";
-    return "stock";
+    const names = [_][]const u8{ "stock", "down_pair", "gu_one", "down_pair,gu_one", "per_k", "down_pair,per_k", "gu_one,per_k", "down_pair,gu_one,per_k" };
+    return names[@as(usize, @intFromBool(f.down_pair)) | @as(usize, @intFromBool(f.gu_one)) << 1 | @as(usize, @intFromBool(f.per_k)) << 2];
 }
 
 test "dsv41 ar: DSV41_CELL_ROUTED_FORMS parses each form once, stock, and refuses the rest by name" {
     try std.testing.expectEqual(xq.Forms{}, try parseForms("stock"));
     try std.testing.expectEqual(xq.Forms{ .down_pair = true }, try parseForms("down_pair"));
     try std.testing.expectEqual(xq.Forms{ .gu_one = true }, try parseForms("gu_one"));
+    try std.testing.expectEqual(xq.Forms{ .per_k = true }, try parseForms("per_k"));
     try std.testing.expectEqual(xq.Forms{ .down_pair = true, .gu_one = true }, try parseForms("gu_one,down_pair"));
-    for ([_][]const u8{ "", "pair", "down_pair,down_pair", "down_pair,", "stock,gu_one" }) |bad| try std.testing.expectError(error.CellRoutedForms, parseForms(bad));
+    try std.testing.expectEqual(xq.Forms{ .down_pair = true, .gu_one = true, .per_k = true }, try parseForms("per_k,gu_one,down_pair"));
+    for ([_][]const u8{ "", "pair", "down_pair,down_pair", "down_pair,", "stock,gu_one", "per_k,per_k", "perk" }) |bad| try std.testing.expectError(error.CellRoutedForms, parseForms(bad));
     try std.testing.expectEqualStrings("down_pair,gu_one", formsName(.{ .down_pair = true, .gu_one = true }));
+    try std.testing.expectEqualStrings("gu_one,per_k", formsName(.{ .gu_one = true, .per_k = true }));
+    try std.testing.expectEqualStrings("down_pair,gu_one,per_k", formsName(.{ .down_pair = true, .gu_one = true, .per_k = true }));
     try std.testing.expectEqualStrings("stock", formsName(.{}));
+    // every name parses back to its forms
+    inline for (.{ xq.Forms{ .per_k = true }, xq.Forms{ .down_pair = true, .per_k = true }, xq.Forms{ .gu_one = true } }) |f| try std.testing.expectEqual(f, try parseForms(formsName(f)));
 }
 
 fn envStr(name: [*:0]const u8) ?[]const u8 {
@@ -1187,7 +1194,7 @@ const CellReceipt = struct {
     head_mode: ?[]const u8 = null,
     /// The mxfp8 head's apply route (installed): RCPROJ (true) or MLX's quantized matmul; null on a bf16 head.
     head_mxfp8_rc: ?bool = null,
-    /// ROUTED_FORMS as installed: "stock", "down_pair", "gu_one" or "down_pair,gu_one".
+    /// ROUTED_FORMS as installed: "stock" or a comma list of down_pair, gu_one, per_k (`formsName`).
     routed_forms: []const u8 = "stock",
     /// DENSE_RC as installed.
     dense_rc: ?bool = null,

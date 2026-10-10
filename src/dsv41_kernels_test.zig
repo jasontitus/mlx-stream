@@ -519,6 +519,109 @@ test "dsv41 kernels ops: the routes carry the lanes' installed configuration" {
     for ([_]*const Entry{ fp.rms, fp.rms_rope, fp.fwd, fp.inv }) |k36| try testing.expectEqual(Dtype.bfloat16, k36.template[0].value.dtype);
 }
 
+test "dsv41 kernels ops: per_k runs each compact GEMV as the four compile-time-K texts in rate order, chained through carry (stock and banked)" {
+    const xq = @import("exl3_quant.zig");
+    var reg = try testRegistry();
+    defer reg.deinit();
+    var t: Trace = .{ .a = testing.allocator };
+    defer t.deinit();
+    const ce = reg.get(.dsv41_exl3_mul1h_compact_2304);
+    const de = reg.get(.dsv41_exl3_mul1h_compact_5120);
+    const s = &ce.samples[0];
+    const code_g = try t.arg(ce, "code", &s.vars);
+    const code_d = try t.arg(de, "code", &s.vars);
+    const desc = try t.arg(ce, "desc", &s.vars);
+    // One projection's chain: the four texts over the same inputs, each after the first fed the previous output;
+    // the head's carry slot holds xh (never read at ACC 0).
+    const Chain = struct {
+        fn expect(tc: *const Trace, n0: usize, texts: xk.PerKTexts, fixed: []const Trace.T, xh: Trace.T, grid0: u32, m: c_int, z: Trace.T) !void {
+            try testing.expectEqual(n0 + 4, tc.launches.items.len);
+            var carry = xh;
+            for (texts, tc.launches.items[n0 .. n0 + 4], 2..) |k, l, kk| {
+                try testing.expectEqual(k, l.k);
+                try testing.expectEqualSlices(Trace.T, fixed, l.inputs[0 .. l.n_in - 1]);
+                try testing.expectEqual(carry, l.inputs[l.n_in - 1]);
+                try testing.expectEqual([3]u32{ grid0, @intCast(m), 1 }, l.cfg.grid);
+                try testing.expectEqual(@as(usize, 1), l.cfg.n_out);
+                try testing.expectEqual(@as(i32, @intCast(kk)), templateInt(l.cfg.template, "K"));
+                try testing.expectEqual(@as(i32, if (kk == 2) 0 else 1), templateInt(l.cfg.template, "ACC"));
+                carry = l.outs[0];
+            }
+            try testing.expectEqual(carry, z);
+        }
+    };
+    for ([_]xq.Forms{ .{}, .{ .per_k = true }, .{ .down_pair = true, .gu_one = true, .per_k = true } }) |f| {
+        var gv = try xq.Gemv(Trace).initStorage(testing.allocator, &t, &reg, f, 0, true);
+        defer gv.deinit(&t);
+        for ([_]c_int{ 1, 6, 48 }) |m| {
+            const xg = try t.node(&.{ m, 5120 }, .float32, &.{});
+            const ids = try t.node(&.{m}, .uint32, &.{});
+            const n0 = t.launches.items.len;
+            const z = try gv.project(&t, .gate, xg, ids, code_g, .{ .compact = desc });
+            const xd = try t.node(&.{ m, 2304 }, .float32, &.{});
+            const zd = try gv.project(&t, .down, xd, ids, code_d, .{ .compact = desc });
+            if (!f.per_k) {
+                try testing.expectEqual(n0 + 2, t.launches.items.len);
+                try testing.expectEqual(xk.Kernel.dsv41_exl3_mul1h_compact_2304, t.back(2).k);
+                try testing.expectEqual(xk.Kernel.dsv41_exl3_mul1h_compact_5120, t.back(1).k);
+                continue;
+            }
+            try Chain.expect(&t, n0, xk.compactk_gu, &.{ xg, ids, code_g, desc }, xg, 4608, m, z);
+            try Chain.expect(&t, n0 + 4, xk.compactk_dn, &.{ xd, ids, code_d, desc }, xd, 10240, m, zd);
+        }
+        // the fixed-storage GEMVs never take the chain
+        var fixed = try xq.Gemv(Trace).initStorage(testing.allocator, &t, &reg, f, 0, false);
+        defer fixed.deinit(&t);
+        try testing.expect(fixed.pk_gu == null and fixed.pk_dn == null);
+    }
+    // banked: the chain inside the stage pair, over the three banks' codes and descriptors
+    const P = xq.ProjArrays(Trace.T);
+    var banks: [3]@import("sdk_ext.zig").quant.BankArrays(P) = undefined;
+    for (&banks) |*b| b.* = .{
+        .gate = .{ .code = try t.arg(ce, "code", &s.vars), .rout = try t.node(&.{ 4, 2304 }, .float16, &.{}), .rin = try t.node(&.{ 4, 5120 }, .float16, &.{}), .layout = .{ .compact = try t.arg(ce, "desc", &s.vars) } },
+        .up = .{ .code = try t.arg(ce, "code", &s.vars), .rout = try t.node(&.{ 4, 2304 }, .float16, &.{}), .rin = try t.node(&.{ 4, 5120 }, .float16, &.{}), .layout = .{ .compact = try t.arg(ce, "desc", &s.vars) } },
+        .down = .{ .code = try t.arg(de, "code", &s.vars), .rout = try t.node(&.{ 4, 5120 }, .float16, &.{}), .rin = try t.node(&.{ 4, 2304 }, .float16, &.{}), .layout = .{ .compact = try t.arg(de, "desc", &s.vars) } },
+    };
+    for ([_]xq.Forms{ .{}, .{ .per_k = true } }) |f| {
+        var gv = try xq.Gemv(Trace).initStorage(testing.allocator, &t, &reg, f, 0, true);
+        defer gv.deinit(&t);
+        var bk = try xq.Banked(Trace).init(&t, &reg, f, &gv);
+        defer bk.deinit(&t);
+        for ([_]c_int{ 1, 8 }) |m| {
+            const x = try t.node(&.{ m, 5120 }, .bfloat16, &.{});
+            const tok = try t.node(&.{m}, .int32, &.{});
+            const ids = try t.node(&.{m}, .uint32, &.{});
+            const n0 = t.launches.items.len;
+            const h = try bk.gateUp(&t, x, tok, ids, &banks);
+            const per = @as(usize, if (f.per_k) 4 else 1);
+            try testing.expectEqual(n0 + 2 + 2 * per, t.launches.items.len);
+            try testing.expectEqual(xk.Kernel.dsv41_exl3_b3_prep_in_rin_compact, t.launches.items[n0].k);
+            try testing.expectEqual(xk.Kernel.dsv41_exl3_b3_prep_gu_epi_compact, t.back(1).k);
+            const xg = t.launches.items[n0].outs[0];
+            const xu = t.launches.items[n0].outs[1];
+            if (f.per_k) {
+                try Chain.expect(&t, n0 + 1, xk.compactk_b3_gu, &.{ xg, ids, banks[0].gate.code, banks[1].gate.code, banks[2].gate.code, banks[0].gate.layout.compact, banks[1].gate.layout.compact, banks[2].gate.layout.compact }, xg, 4608, m, t.back(1).inputs[0]);
+                try Chain.expect(&t, n0 + 5, xk.compactk_b3_gu, &.{ xu, ids, banks[0].up.code, banks[1].up.code, banks[2].up.code, banks[0].up.layout.compact, banks[1].up.layout.compact, banks[2].up.layout.compact }, xu, 4608, m, t.back(1).inputs[1]);
+            } else {
+                try testing.expectEqual(xk.Kernel.dsv41_exl3_b3_mul1h_compact_2304, t.launches.items[n0 + 1].k);
+                try testing.expectEqual(xk.Kernel.dsv41_exl3_b3_mul1h_compact_2304, t.launches.items[n0 + 2].k);
+            }
+            const n1 = t.launches.items.len;
+            _ = try bk.down(&t, h, ids, &banks);
+            try testing.expectEqual(n1 + 2 + per, t.launches.items.len);
+            try testing.expectEqual(xk.Kernel.dsv41_exl3_b3_prep_din_rin_compact, t.launches.items[n1].k);
+            try testing.expectEqual(xk.Kernel.dsv41_exl3_b3_moeprep_dpost_compact, t.back(1).k);
+            const hd = t.launches.items[n1].outs[0];
+            if (f.per_k) {
+                try Chain.expect(&t, n1 + 1, xk.compactk_b3_dn, &.{ hd, ids, banks[0].down.code, banks[1].down.code, banks[2].down.code, banks[0].down.layout.compact, banks[1].down.layout.compact, banks[2].down.layout.compact }, hd, 10240, m, t.back(1).inputs[0]);
+            } else {
+                try testing.expectEqual(xk.Kernel.dsv41_exl3_b3_mul1h_compact_5120, t.launches.items[n1 + 1].k);
+            }
+        }
+    }
+    try testing.expectEqual(@as(isize, 0), t.prepared_live);
+}
+
 test "dsv41 kernels ops: the routed forms launch their texts with the stock arguments (down pair; gate + up in one launch)" {
     const xq = @import("exl3_quant.zig");
     var reg = try testRegistry();

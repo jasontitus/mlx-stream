@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
-pub const manifest_sha256 = "1790f2036ac40b0d962edffe046b9011e364b95385a9269d632803a60bab8594";
+pub const manifest_sha256 = "689a40a05d7d116179ae95348378917bf15c69e98e7c6d7a5ea69611a275e63f";
 
 /// G7: the package's decode-timers build observes each launch of a bound set (its first dispatches per phase, the
 /// observer `Bound.observe` installs); every other build has no observer field, launch key or call.
@@ -195,6 +195,24 @@ pub const Kernel = enum {
     dsv41_exl3_b3_moeprep_dpost_compact,
     dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compact_m128,
     dsv41_prefill_dig_gemm_2304x5120_xmul1h_compact_m128,
+    // The per-rate decode chain over compact records (ROUTED_FORMS per_k): the compact GEMV at compile-time K, one
+    // launch per rate (K 2 .. 5) carrying the other rows' words through `carry` (base: K 2, ACC 0, the chain's head).
+    dsv41_exl3_mul1h_compactk_2304,
+    dsv41_exl3_mul1h_compactk_2304__k3,
+    dsv41_exl3_mul1h_compactk_2304__k4,
+    dsv41_exl3_mul1h_compactk_2304__k5,
+    dsv41_exl3_mul1h_compactk_5120,
+    dsv41_exl3_mul1h_compactk_5120__k3,
+    dsv41_exl3_mul1h_compactk_5120__k4,
+    dsv41_exl3_mul1h_compactk_5120__k5,
+    dsv41_exl3_b3_mul1h_compactk_2304,
+    dsv41_exl3_b3_mul1h_compactk_2304__k3,
+    dsv41_exl3_b3_mul1h_compactk_2304__k4,
+    dsv41_exl3_b3_mul1h_compactk_2304__k5,
+    dsv41_exl3_b3_mul1h_compactk_5120,
+    dsv41_exl3_b3_mul1h_compactk_5120__k3,
+    dsv41_exl3_b3_mul1h_compactk_5120__k4,
+    dsv41_exl3_b3_mul1h_compactk_5120__k5,
 };
 
 /// The text a tag runs: its own, or a variant's base (the part before "__").
@@ -271,6 +289,33 @@ pub const compact_kernels = [_]Kernel{
     .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1h_compact_m128,
     .dsv41_prefill_dig_gemm_2304x5120_xmul1h_compact_m128,
 };
+
+/// The per-rate chain's texts, in launch order per projection (gate / up 2304, down 5120; stock, then banked): the
+/// compact GEMV instantiated at K 2, 3, 4, 5. Routed by `DSV41_CELL_ROUTED_FORMS=per_k` on compact storage only.
+pub const compactk_kernels = [_]Kernel{
+    .dsv41_exl3_mul1h_compactk_2304,
+    .dsv41_exl3_mul1h_compactk_2304__k3,
+    .dsv41_exl3_mul1h_compactk_2304__k4,
+    .dsv41_exl3_mul1h_compactk_2304__k5,
+    .dsv41_exl3_mul1h_compactk_5120,
+    .dsv41_exl3_mul1h_compactk_5120__k3,
+    .dsv41_exl3_mul1h_compactk_5120__k4,
+    .dsv41_exl3_mul1h_compactk_5120__k5,
+    .dsv41_exl3_b3_mul1h_compactk_2304,
+    .dsv41_exl3_b3_mul1h_compactk_2304__k3,
+    .dsv41_exl3_b3_mul1h_compactk_2304__k4,
+    .dsv41_exl3_b3_mul1h_compactk_2304__k5,
+    .dsv41_exl3_b3_mul1h_compactk_5120,
+    .dsv41_exl3_b3_mul1h_compactk_5120__k3,
+    .dsv41_exl3_b3_mul1h_compactk_5120__k4,
+    .dsv41_exl3_b3_mul1h_compactk_5120__k5,
+};
+/// The chain's four texts for one projection: `compactk_kernels[4 * i ..][0..4]` (i: gu, dn, banked gu, banked dn).
+pub const PerKTexts = *const [4]Kernel;
+pub const compactk_gu: PerKTexts = compactk_kernels[0..4];
+pub const compactk_dn: PerKTexts = compactk_kernels[4..8];
+pub const compactk_b3_gu: PerKTexts = compactk_kernels[8..12];
+pub const compactk_b3_dn: PerKTexts = compactk_kernels[12..16];
 
 /// Header texts shared by several kernels (file header_<tag>.metal).
 pub const Header = enum { dig2_x, dig_mul1_k3, dig_mul1h_k3, hctape, rcproj, router_tail, woa_e4m3, index_topk, attnfuse, mxfp8_m1rows, attnfuse_s2, attnhalf_idx, pf_hc, smallk, joinless, dig_mul1h_k3_lut, hcpost_tf32, mul1h_rate };

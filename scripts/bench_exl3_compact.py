@@ -15,7 +15,9 @@ from DRAM rather than the system cache.
 
 Needs Apple silicon, `pip install mlx numpy`. Prints one row per (case, tree): microseconds per launch, the code
 stream's effective GB/s, the speedup over the first tree and whether the output is bit-identical to the first tree's
-(`ref`: the tight-K3 kernel, which reads the same K3 codes through its fixed stride)."""
+(`ref`: the tight-K3 kernel, which reads the same K3 codes through its fixed stride). A tree whose manifest carries the
+compactk texts (opt/decode-per-k) also times their per-rate chain as `<tree> per_k`, four launches composed as the
+plugin's ROUTED_FORMS=per_k route composes them, checked against the compact launch's words."""
 import argparse
 import json
 import os
@@ -74,10 +76,12 @@ def dim(d, vs):
 
 
 def launch(tree, name, args, vs):
-    """args: the kernel's inputs by name (mx arrays); vs: the manifest vars of this launch."""
+    """args: the kernel's inputs by name (mx arrays); vs: the manifest vars of this launch. A templated entry (the
+    compactk texts' K / ACC) is instantiated at its recorded ints."""
     import mlx.core as mx
     k, fn = tree.kernel(name)
-    return fn(inputs=[args[i["name"]] for i in k["inputs"]], grid=tuple(dim(d, vs) for d in k["grid"]),
+    template = [(t["name"], t["int"]) for t in k.get("template", []) if "int" in t]
+    return fn(inputs=[args[i["name"]] for i in k["inputs"]], template=template or None, grid=tuple(dim(d, vs) for d in k["grid"]),
               threadgroup=tuple(k["threadgroup"]),
               output_shapes=[tuple(dim(d, vs) for d in o["shape"]) for o in k["outputs"]],
               output_dtypes=[getattr(mx, {"float32": "float32", "float16": "float16"}[o["dtype"]]) for o in k["outputs"]])
@@ -170,20 +174,31 @@ def bench_decode(trees, args, rng, rows_out):
                     name = f"dsv41_exl3_{'b3_' if banked else ''}mul1h_compact_{shape}"
                     case = f"decode {name[11:]} {set_name} rows={rows}"
                     base = first = None
+                    def inputs(i):
+                        if banked:  # one arena behind all three banks; bank b's ids carry b << 24
+                            ids = picks[i] | mx.array((np.arange(rows) % 3 << 24).astype(np.uint32))
+                            return {"xh": xh, "ids": ids, "code0": arena.code, "code1": arena.code, "code2": arena.code,
+                                    "desc0": arena.desc, "desc1": arena.desc, "desc2": arena.desc}
+                        return {"xh": xh, "ids": picks[i], "code": arena.code, "desc": arena.desc}
                     for tree in trees:
                         def make(i, tree=tree):
-                            if banked:  # one arena behind all three banks; bank b's ids carry b << 24
-                                ids = picks[i] | mx.array((np.arange(rows) % 3 << 24).astype(np.uint32))
-                                a = {"xh": xh, "ids": ids, "code0": arena.code, "code1": arena.code, "code2": arena.code,
-                                     "desc0": arena.desc, "desc1": arena.desc, "desc2": arena.desc}
-                            else:
-                                a = {"xh": xh, "ids": picks[i], "code": arena.code, "desc": arena.desc}
-                            return launch(tree, name, a, vs)
+                            return launch(tree, name, inputs(i), vs)
                         sec, out = timed(make, args.iters)
                         exact = "first" if first is None else same(first, out)
                         first = first if first is not None else out
                         base = base or sec
                         report(rows_out, case, tree.label, sec, nbytes, base, exact)
+                        # The per-rate chain where the tree has it (ROUTED_FORMS per_k): the compactk text at K 2 .. 5 in
+                        # turn, each carrying the other rows' words from the previous launch (the head's carry slot: xh).
+                        pk = name.replace("_compact_", "_compactk_")
+                        if pk in tree.specs:
+                            def make_pk(i, tree=tree, pk=pk):
+                                a, carry = inputs(i), xh
+                                for K in (2, 3, 4, 5):
+                                    carry = launch(tree, pk if K == 2 else f"{pk}__k{K}", dict(a, carry=carry), vs)[0]
+                                return [carry]
+                            sec, out = timed(make_pk, args.iters)
+                            report(rows_out, case, f"{tree.label} per_k", sec, nbytes, base, same(first, out))
                     if arena.uniform_k3 and not banked:
                         zeros = {n: mx.zeros((s,), dtype=mx.int32) for n, s in (("lane_a", 32), ("lane_b", 32), ("lane_p", 32), ("pos_r", 256), ("pos_c", 256))}
                         cb = mx.array(np.array([3417055213, 0, 2415890431, 996162400], dtype=np.uint32))

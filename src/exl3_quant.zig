@@ -79,10 +79,12 @@ pub const kernels = [_]Kernel{
     .dsv41_exl3_b3_moeprep_dpost,
     .dsv41_exl3_b3_pair_k3_5120,
     .dsv41_exl3_b3_guone_k3_2304,
-} ++ xk.rate_kernels ++ xk.compact_kernels;
+} ++ xk.rate_kernels ++ xk.compact_kernels ++ xk.compactk_kernels;
 
 /// The routed decode forms (`DSV41_CELL_ROUTED_FORMS`): each independently selectable, chosen at construction.
-pub const Forms = struct { down_pair: bool = false, gu_one: bool = false };
+/// down_pair / gu_one rebuild fixed-K3 storage's GEMVs; per_k rebuilds compact storage's as the per-rate chain
+/// (`xk.compactk_kernels`: one compile-time-K launch per rate, chained through `carry`). Each is a no-op on the other storage.
+pub const Forms = struct { down_pair: bool = false, gu_one: bool = false, per_k: bool = false };
 
 /// One projection's per-slot arrays: the streamer's `ProjArrays` {code, rout, rin}.
 pub fn Arrays(comptime T: type) type {
@@ -465,9 +467,9 @@ pub const banked_texts = [_]Kernel{
 };
 pub const checked_at_accept = blk: {
     @setEvalBranchQuota(4000);
-    var out: [kernels.len - w1_texts.len - lut_texts.len - form_texts.len - banked_texts.len - xk.rate_kernels.len - xk.compact_kernels.len]Kernel = undefined;
+    var out: [kernels.len - w1_texts.len - lut_texts.len - form_texts.len - banked_texts.len - xk.rate_kernels.len - xk.compact_kernels.len - xk.compactk_kernels.len]Kernel = undefined;
     var n: usize = 0;
-    for (kernels) |k| if (std.mem.indexOfScalar(Kernel, &(w1_texts ++ lut_texts ++ form_texts ++ banked_texts ++ xk.rate_kernels ++ xk.compact_kernels), k) == null) {
+    for (kernels) |k| if (std.mem.indexOfScalar(Kernel, &(w1_texts ++ lut_texts ++ form_texts ++ banked_texts ++ xk.rate_kernels ++ xk.compact_kernels ++ xk.compactk_kernels), k) == null) {
         out[n] = k;
         n += 1;
     };
@@ -635,6 +637,43 @@ fn freeRatePlans(comptime G: type, a: Allocator, g: *G, plans: *[3]?*RowPlans(G,
     };
 }
 
+/// The per-rate chain's plans for one projection (`xk.compactk_*`), in launch order.
+fn allocPerKPlans(comptime G: type, a: Allocator, g: *G, reg: *const xk.Registry, texts: xk.PerKTexts) !*[4]RowPlans(G, 48) {
+    const p = try a.create([4]RowPlans(G, 48));
+    errdefer a.destroy(p);
+    var built: usize = 0;
+    errdefer for (p[0..built]) |*x| x.deinit(g);
+    for (p, texts) |*x, k| {
+        x.* = try .init(g, reg.get(k), null, null);
+        built += 1;
+    }
+    return p;
+}
+
+fn freePerKPlans(comptime G: type, a: Allocator, g: *G, plans: *?*[4]RowPlans(G, 48)) void {
+    const p = plans.* orelse return;
+    for (p) |*x| x.deinit(g);
+    a.destroy(p);
+    plans.* = null;
+}
+
+/// The per-rate chain (ROUTED_FORMS per_k, compact storage): the compact GEMV's four compile-time-K texts in rate order
+/// (K 2, 3, 4, 5), each over every row of the call. A launch computes the rows at its K and carries every other row's
+/// word from the previous launch's output (`carry`, the input after `ins[0..n]`); the head (ACC 0) writes zeros there
+/// and never reads its carry, so `ins[0]` (xh: f32, the call's rows) stands in for the array MLX binds. The banked
+/// texts keep the miss sentinel's zero row. Against the one compact launch: three more launches and three reads plus
+/// three writes of the output (~3% of the codes each launch streams, at any row count); no host sum, no zeros array.
+fn launchPerK(comptime G: type, g: *G, chain: *const [4]RowPlans(G, 48), rows: u64, ins: []G.T, n: usize) !G.T {
+    var carry = ins[0];
+    for (chain) |*p| {
+        ins[n] = carry;
+        var out: [1]G.T = undefined;
+        try p.launch(g, rows, ins[0 .. n + 1], &out);
+        carry = out[0];
+    }
+    return carry;
+}
+
 /// The decode GEMVs (form mul1h, K 3): `Provider.project`.
 pub fn Gemv(comptime G: type) type {
     return struct {
@@ -656,6 +695,9 @@ pub fn Gemv(comptime G: type) type {
         rate_dn: [3]?*RowPlans(G, 48) = @splat(null),
         rate_gu_e: [3]*const Entry = undefined,
         rate_dn_e: [3]*const Entry = undefined,
+        /// per_k on compact storage: the chain's four plans per projection, in launch order (`launchPerK`)
+        pk_gu: ?*[4]RowPlans(G, 48) = null,
+        pk_dn: ?*[4]RowPlans(G, 48) = null,
 
         const GuCall = fn (self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, code_g: G.T, code_u: G.T) anyerror![2]G.T;
 
@@ -689,6 +731,8 @@ pub fn Gemv(comptime G: type) type {
                 self.dn_statics.deinit(g);
                 freeRatePlans(G, a, g, &self.rate_gu);
                 freeRatePlans(G, a, g, &self.rate_dn);
+                freePerKPlans(G, a, g, &self.pk_gu);
+                freePerKPlans(G, a, g, &self.pk_dn);
             }
             inline for (.{ Kernel.dsv41_exl3_mul1h_rate_2304, Kernel.dsv41_exl3_mul1h_rate_2304__k3, Kernel.dsv41_exl3_mul1h_rate_2304__k4 }, .{ Kernel.dsv41_exl3_mul1h_rate_5120, Kernel.dsv41_exl3_mul1h_rate_5120__k3, Kernel.dsv41_exl3_mul1h_rate_5120__k4 }, 0..) |kg, kd, i| {
                 if (!compact and rate_mask & (@as(u3, 1) << i) != 0) {
@@ -697,6 +741,10 @@ pub fn Gemv(comptime G: type) type {
                     self.rate_gu[i] = try allocRatePlan(G, a, g, self.rate_gu_e[i]);
                     self.rate_dn[i] = try allocRatePlan(G, a, g, self.rate_dn_e[i]);
                 }
+            }
+            if (compact and forms.per_k) {
+                self.pk_gu = try allocPerKPlans(G, a, g, reg, xk.compactk_gu);
+                self.pk_dn = try allocPerKPlans(G, a, g, reg, xk.compactk_dn);
             }
             return self;
         }
@@ -709,6 +757,8 @@ pub fn Gemv(comptime G: type) type {
             self.dn_statics.deinit(g);
             freeRatePlans(G, self.rate_a, g, &self.rate_gu);
             freeRatePlans(G, self.rate_a, g, &self.rate_dn);
+            freePerKPlans(G, self.rate_a, g, &self.pk_gu);
+            freePerKPlans(G, self.rate_a, g, &self.pk_dn);
         }
 
         /// Tight K3 keeps its installed form; other layouts use their prepared direct-rate plans.
@@ -733,9 +783,12 @@ pub fn Gemv(comptime G: type) type {
         pub fn project(self: *const Self, g: *G, proj: Proj, xh: G.T, ids: G.T, code: G.T, layout: ProjectionStorage(G.T)) !G.T {
             if ((layout == .compact) != self.compact) return error.StorageNotPrepared;
             if (layout == .compact) {
+                const rows = rowsOf(G, g, xh, 0);
+                var ins = [_]G.T{ xh, ids, code, layout.compact, undefined };
+                if (if (proj == .down) self.pk_dn else self.pk_gu) |chain| return launchPerK(G, g, chain, rows, &ins, 4);
                 const plan = if (proj == .down) &self.dn_p else &self.gu_p;
                 var out: [1]G.T = undefined;
-                try plan.launch(g, rowsOf(G, g, xh, 0), &.{ xh, ids, code, layout.compact }, &out);
+                try plan.launch(g, rows, ins[0..4], &out);
                 return out[0];
             }
             const direct = !layout.tightK3();
@@ -789,6 +842,9 @@ pub fn Banked(comptime G: type) type {
         rate_dn_e: [3]*const Entry = undefined,
         rate_gu_st: [xk.max_inputs]G.T = undefined,
         rate_dn_st: [xk.max_inputs]G.T = undefined,
+        /// per_k on compact storage: the banked chain's four plans per projection, in launch order (`launchPerK`)
+        pk_gu: ?*[4]RowPlans(G, 48) = null,
+        pk_dn: ?*[4]RowPlans(G, 48) = null,
 
         const GuCall = fn (self: *const Self, g: *G, xg: G.T, xu: G.T, ids: G.T, banks: *const [3]BA) anyerror![2]G.T;
 
@@ -824,6 +880,11 @@ pub fn Banked(comptime G: type) type {
                     self.rate_dn[i] = try allocRatePlan(G, self.rate_a, g, self.rate_dn_e[i]);
                 }
             }
+            if (compact and forms.per_k) {
+                self.pk_gu = try allocPerKPlans(G, self.rate_a, g, reg, xk.compactk_b3_gu);
+                errdefer freePerKPlans(G, self.rate_a, g, &self.pk_gu);
+                self.pk_dn = try allocPerKPlans(G, self.rate_a, g, reg, xk.compactk_b3_dn);
+            }
             return self;
         }
 
@@ -855,6 +916,8 @@ pub fn Banked(comptime G: type) type {
             self.dn_p.deinit(g);
             freeRatePlans(G, self.rate_a, g, &self.rate_gu);
             freeRatePlans(G, self.rate_a, g, &self.rate_dn);
+            freePerKPlans(G, self.rate_a, g, &self.pk_gu);
+            freePerKPlans(G, self.rate_a, g, &self.pk_dn);
         }
 
         fn tightBanks(comptime proj: Proj, banks: *const [3]BA) bool {
@@ -898,7 +961,7 @@ pub fn Banked(comptime G: type) type {
                 inline for (0..3) |b| ins[5 + b] = banks[b].down.layout.compact;
             }
             var zd: [1]G.T = undefined;
-            try plan.launch(g, rows, ins[0..entry.inputs.len], &zd);
+            if (self.pk_dn) |chain| zd[0] = try launchPerK(G, g, chain, rows, &ins, 8) else try plan.launch(g, rows, ins[0..entry.inputs.len], &zd);
             var out: [1]G.T = undefined;
             try self.dpost_p.launch(g, rows, &.{ zd[0], banks[0].down.rout, banks[1].down.rout, banks[2].down.rout, ids }, &out);
             return out[0];
@@ -922,7 +985,7 @@ pub fn Banked(comptime G: type) type {
                     inline for (0..3) |b| ins[5 + b] = @field(banks[b], @tagName(proj)).layout.compact;
                 }
                 var z: [1]G.T = undefined;
-                try plan.launch(g, rows, ins[0..entry.inputs.len], &z);
+                if (self.pk_gu) |chain| z[0] = try launchPerK(G, g, chain, rows, &ins, 8) else try plan.launch(g, rows, ins[0..entry.inputs.len], &z);
                 out[o] = z[0];
             }
             return out;
@@ -3993,7 +4056,7 @@ test "dsv41 pre-ship gate: the kernels' full self-check plan on the device, ever
     var failed: usize = 0;
     // Both depths, each timed: the construction runs `.compile`; `.full` is the manifest's whole plan (the numeric probes).
     inline for (.{ selfcheck.Depth.compile, selfcheck.Depth.full }) |depth| {
-        inline for (.{ .{ "exl3_quant_accept", &checked_at_accept }, .{ "exl3_integer_rates", &xk.rate_kernels }, .{ "exl3_compact", &xk.compact_kernels }, .{ "trunk_routes", &trunk.kernels } }) |plan| {
+        inline for (.{ .{ "exl3_quant_accept", &checked_at_accept }, .{ "exl3_integer_rates", &xk.rate_kernels }, .{ "exl3_compact", &xk.compact_kernels }, .{ "exl3_compact_per_k", &xk.compactk_kernels }, .{ "trunk_routes", &trunk.kernels } }) |plan| {
             var report: selfcheck.Report = .{};
             defer report.deinit(a);
             const t0 = std.Io.Timestamp.now(testing.io, .awake);

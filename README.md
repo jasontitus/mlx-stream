@@ -173,7 +173,7 @@ served behavior.
 |---|---|---|---|
 | `DSV41_BILL_VARIANT` | server | `conservative` | `tight` bills one live K16 routed-group stream instead of four (only with the model's chunk-fenced taps). Any other value is refused by name at construction. |
 | `DSV41_SELFCHECK_REPORT` | server | off | `1` logs every kernel self-check result at construction (a failure is always logged and refuses the load). |
-| `DSV41_CELL_ROUTED_FORMS` | cell | `stock` | `down_pair`, `gu_one` or both (comma list): the routed decode GEMVs rebuilt on those exact texts. |
+| `DSV41_CELL_ROUTED_FORMS` | cell | `stock` | a comma list of `down_pair`, `gu_one` (fixed-K3 storage) and `per_k` (compact storage): the routed decode GEMVs rebuilt on those exact texts. `per_k` runs each compact GEMV as four compile-time-K launches (K 2 .. 5), each computing its rate's rows and carrying the rest from the previous launch's output. |
 | `DSV41_CELL_ROUTED_BANKED` | cell | `0` | `1`: each routed decode stage runs as one launch over every bank's rows (exact). |
 | `DSV41_CELL_DEVROUTE` | cell | `0` | `1`: decode's hit wave runs as a device graph before the host's routing wait (exact; needs `ROUTED_BANKED`). |
 | `DSV41_CELL_HOIST_FIRST` | cell | `0` | `1`: each decode call commits its hoist right behind the routing barrier's arrays (exact). |

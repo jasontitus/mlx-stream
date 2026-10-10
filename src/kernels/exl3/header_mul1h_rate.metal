@@ -1193,3 +1193,85 @@ METAL_FUNC void rate_dec_job(const device uint* tile, uint c7, threadgroup half*
         }
     }
 }
+
+// ---- staged-x decode ----
+// The compact decode GEMVs with staged activations: a threadgroup of SX_NSG simdgroups handles SX_NSG consecutive
+// 16-output tile columns of one assignment row. The row's activations are staged once in threadgroup memory
+// (sx_stage: float4 loads spread over the threadgroup, then one barrier in the kernel) and each simdgroup walks its
+// tile column at a compile-time K (sx_tiles). The K3 path is the K3 kernels' funnel-shift decode verbatim, and every
+// path keeps their acc[m] fma order, so the outputs are bit-identical to the one-simdgroup kernels.
+// SX_NSG is the manifest's threadgroup width / 32 (the grid's threads are unchanged: SX_NSG tile columns per group).
+STEEL_CONST uint SX_NSG = 4u;
+
+// xs[0 .. N / 4) = xp[0 .. N) by THREADS threads (tid = thread_index_in_threadgroup), coalesced float4 loads; N a
+// multiple of 4, xp 16-byte aligned (a row of a contiguous [rows, N] f32 array)
+template <uint N, uint THREADS>
+METAL_FUNC void sx_stage(const device float* xp, threadgroup float4* xs, uint tid) {
+    const device float4* src = reinterpret_cast<const device float4*>(xp);
+    for (uint i = tid; i < N / 4u; i += THREADS) xs[i] = src[i];
+}
+
+// acc[m] += xs[16 tk + dr[m]] w over the TK tiles of tile column tn (TILES tile columns per tile row, 16 K shorts per
+// tile): the lane's 8 windows m = 0..7 of each tile (the decode GEMVs' lane plan).
+template <int K, uint TK, uint TILES, int UNROLL>
+METAL_FUNC void sx_tiles(const device short* base, uint tn, const threadgroup float* xs, uint lane, thread float* acc) {
+    uint dr[8];
+    for (uint m = 0; m < 8u; ++m) { uint q = m & 3u; dr[m] = 2u * (lane & 3u) + (q < 2u ? 9u : 3u) - q; }
+    if constexpr (K == 3) {
+        uint wa = 2u * ((3u * lane + 2u) >> 2); uint wb = (wa + 46u) % 48u; uint lp = 8u * ((lane + 1u) & 3u);
+        #pragma clang loop unroll_count(UNROLL)
+        for (uint tk = 0; tk < TK; ++tk) {
+            const device uint* tile32 = reinterpret_cast<const device uint*>(base + (tk * TILES + tn) * 48u);
+            uint rd8 = tile32[wa >> 1u];
+            uint rd9 = tile32[wb >> 1u];
+            // The lane's 8 windows sit at bit offsets 3m (m = 0..7) of v = (rd9:rd8) >> lp.  Windows 0..5 end at
+            // bit 31 at most, 6..7 need bits 18..40: two 32-bit funnel-shifted words cover all eight without any
+            // 64-bit shift in the loop (Apple GPUs emulate ulong shifts with several 32-bit ops).
+            // lane_p (lp) is one of (0, 8, 16, 24): funnel-shift the two 32-bit halves accordingly.
+            uint v0 = (lp == 0u) ? rd8 : ((rd8 >> lp) | (rd9 << (32u - lp)));      // bits 0..31 of v
+            uint v1 = (lp < 16u) ? ((rd8 >> (lp + 16u)) | (rd9 << (16u - lp)))     // bits 16..47 of v
+                                 : (rd9 >> (lp - 16u));
+            for (uint m = 0; m < 6u; ++m) {
+                uint window = (v0 >> (3u * m)) & 0xffffu;
+                uint rr = window * 0x83DCD12Du;
+                uint bs = (rr & 0x00FF00FFu) + ((rr >> 8u) & 0x00FF00FFu);
+                half hs = as_type<half>(ushort((bs * 0x00010001u + 0x64000000u) >> 16u));
+                float w = float(metal::fma(hs, as_type<half>(ushort(0x1EEEu)), as_type<half>(ushort(0xC931u))));
+                acc[m] = metal::fma(xs[tk * 16u + dr[m]], w, acc[m]);
+            }
+            for (uint m = 6u; m < 8u; ++m) {
+                uint window = (v1 >> (3u * m - 16u)) & 0xffffu;
+                uint rr = window * 0x83DCD12Du;
+                uint bs = (rr & 0x00FF00FFu) + ((rr >> 8u) & 0x00FF00FFu);
+                half hs = as_type<half>(ushort((bs * 0x00010001u + 0x64000000u) >> 16u));
+                float w = float(metal::fma(hs, as_type<half>(ushort(0x1EEEu)), as_type<half>(ushort(0xC931u))));
+                acc[m] = metal::fma(xs[tk * 16u + dr[m]], w, acc[m]);
+            }
+        }
+    } else {
+        #pragma clang loop unroll_count(UNROLL)
+        for (uint tk = 0; tk < TK; ++tk) {
+            const device uint* tile32 = reinterpret_cast<const device uint*>(base + (tk * TILES + tn) * (16u * uint(K)));
+            for (uint m = 0; m < 8u; ++m) {
+                const float w = float(dig_cb(rate_window<K>(tile32, 8u * lane + 7u - m)));
+                acc[m] = metal::fma(xs[tk * 16u + dr[m]], w, acc[m]);
+            }
+        }
+    }
+}
+
+// The simdgroup's 16 outputs from its lanes' acc[m] through red (its [16][32] slice of threadgroup memory, the
+// one-simdgroup kernels' reduction order) to outp[0 .. 16).
+METAL_FUNC void sx_reduce(threadgroup float* red, thread const float* acc, uint lane, device float* outp) {
+    uint dc[8];
+    for (uint m = 0; m < 8u; ++m) dc[m] = (lane >> 2) + (m < 4u ? 8u : 0u);
+    for (uint c = 0; c < 16u; ++c) red[c * 32u + lane] = 0.0f;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint m = 0; m < 8u; ++m) red[dc[m] * 32u + lane] += acc[m];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 16u) {
+        float s = 0.0f;
+        for (uint l = 0; l < 32u; ++l) s += red[lane * 32u + l];
+        outp[lane] = s;
+    }
+}
